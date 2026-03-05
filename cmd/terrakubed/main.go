@@ -98,6 +98,8 @@ func startAPI(cfg *config.Config) {
 		OwnerGroup:     cfg.OwnerGroup,
 		UIURL:          cfg.TerrakubeUiURL,
 		StorageType:    cfg.StorageType,
+		RedisAddress:   cfg.RedisAddress,
+		RedisPassword:  cfg.RedisPassword,
 	}
 
 	server, err := api.NewServer(apiConfig)

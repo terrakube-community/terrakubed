@@ -6,11 +6,14 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/ilkerispir/terrakubed/internal/api/database"
 	"github.com/ilkerispir/terrakubed/internal/api/handler"
 	"github.com/ilkerispir/terrakubed/internal/api/middleware"
 	"github.com/ilkerispir/terrakubed/internal/api/registry"
 	"github.com/ilkerispir/terrakubed/internal/api/repository"
+	"github.com/ilkerispir/terrakubed/internal/api/streaming"
 	"github.com/ilkerispir/terrakubed/internal/storage"
 )
 
@@ -25,6 +28,8 @@ type Config struct {
 	OwnerGroup     string
 	UIURL          string
 	StorageType    string
+	RedisAddress   string
+	RedisPassword  string
 }
 
 // Server is the main API server.
@@ -57,7 +62,6 @@ func NewServer(config Config) (*Server, error) {
 
 	// Create custom handlers
 	logsHandler := handler.NewLogsHandler(repo)
-	outputHandler := handler.NewTerraformOutputHandler(repo)
 	contextHandler := handler.NewContextHandler(repo)
 
 	// Create storage service
@@ -66,6 +70,27 @@ func NewServer(config Config) (*Server, error) {
 		log.Printf("Warning: storage service not available (%v), using nop", err)
 		storageService = &storage.NopStorageService{}
 	}
+
+	// Create Redis client for live log streaming (optional — degraded gracefully)
+	var redisClient *redis.Client
+	if config.RedisAddress != "" {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:     config.RedisAddress,
+			Password: config.RedisPassword,
+		})
+		if err := redisClient.Ping(ctx).Err(); err != nil {
+			log.Printf("Warning: Redis not reachable at %s (%v) — live log streaming disabled", config.RedisAddress, err)
+			redisClient = nil
+		} else {
+			log.Printf("Redis connected at %s — live log streaming enabled", config.RedisAddress)
+		}
+	} else {
+		log.Printf("Redis not configured (TerrakubeRedisHostname / REDIS_HOST not set) — serving logs from storage only")
+	}
+
+	logStreamer := streaming.NewLogStreamReader(redisClient, storageService)
+
+	outputHandler := handler.NewTerraformOutputHandler(repo, logStreamer)
 
 	// State & TFE handlers
 	stateHandler := handler.NewTerraformStateHandler(db.Pool, config.Hostname, storageService)
