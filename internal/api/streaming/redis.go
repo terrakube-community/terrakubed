@@ -3,132 +3,96 @@ package streaming
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"strings"
-	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/ilkerispir/terrakubed/internal/storage"
 )
 
-// RedisStreamReader reads job logs from Redis streams.
-// This is a placeholder implementation — will use go-redis when integrated.
-type RedisStreamReader struct {
-	pool *pgxpool.Pool
-	// redisClient *redis.Client — to be added
+// LogStreamReader reads job logs from Redis Streams with fallback to object storage.
+// Mirrors the Java StreamingServiceRedis + TerraformOutputController pattern.
+type LogStreamReader struct {
+	redis   *redis.Client
+	storage storage.StorageService
 }
 
-// NewRedisStreamReader creates a new reader.
-func NewRedisStreamReader(pool *pgxpool.Pool) *RedisStreamReader {
-	return &RedisStreamReader{pool: pool}
-}
-
-// GetCurrentLogs reads logs from Redis stream for a given step.
-// Matches the Java StreamingService.getCurrentLogs() logic:
-// 1. Look up the step to get the job ID (Redis stream key)
-// 2. Read all entries from the Redis stream using StreamOffset.fromStart()
-// 3. Extract "output" field from each entry
-// 4. Return concatenated output
-func (r *RedisStreamReader) GetCurrentLogs(ctx context.Context, stepID string) (string, error) {
-	// Get the job ID for this step (used as Redis stream key)
-	var jobID int
-	err := r.pool.QueryRow(ctx,
-		"SELECT job_id FROM step WHERE id = $1", stepID,
-	).Scan(&jobID)
-	if err != nil {
-		return "", fmt.Errorf("step not found: %w", err)
+// NewLogStreamReader creates a LogStreamReader.
+// redisClient may be nil — in that case Redis lookups are skipped and only storage is used.
+func NewLogStreamReader(redisClient *redis.Client, storageService storage.StorageService) *LogStreamReader {
+	return &LogStreamReader{
+		redis:   redisClient,
+		storage: storageService,
 	}
-
-	streamKey := fmt.Sprintf("%d", jobID)
-	log.Printf("Reading Redis stream: %s (for step %s)", streamKey, stepID)
-
-	// TODO: Use go-redis to read from stream
-	// Example:
-	// msgs, err := r.redisClient.XRange(ctx, streamKey, "-", "+").Result()
-	// for _, msg := range msgs {
-	//     output := msg.Values["output"].(string)
-	//     logs.WriteString(output + "\n")
-	// }
-
-	_ = streamKey
-	return "", nil // No Redis connection yet
 }
 
-// AppendLog writes a log entry to the Redis stream.
-func (r *RedisStreamReader) AppendLog(ctx context.Context, jobID string, output string) error {
-	log.Printf("Append log to Redis stream: %s (%d bytes)", jobID, len(output))
-
-	// TODO: Use go-redis to write to stream
-	// r.redisClient.XAdd(ctx, &redis.XAddArgs{
-	//     Stream: jobID,
-	//     Values: map[string]interface{}{"output": output},
-	// })
-
-	return nil
-}
-
-// SetupConsumerGroup creates a Redis consumer group for a job stream.
-func (r *RedisStreamReader) SetupConsumerGroup(ctx context.Context, jobID string) error {
-	log.Printf("Setup consumer group for stream: %s", jobID)
-
-	// TODO: Use go-redis
-	// r.redisClient.XGroupCreateMkStream(ctx, jobID, "terrakube-group", "0")
-
-	return nil
-}
-
-// StreamLog provides SSE-like streaming of logs for a step.
-func (r *RedisStreamReader) StreamLog(ctx context.Context, stepID string, output chan<- string) error {
-	var jobID int
-	err := r.pool.QueryRow(ctx,
-		"SELECT job_id FROM step WHERE id = $1", stepID,
-	).Scan(&jobID)
-	if err != nil {
-		return fmt.Errorf("step not found: %w", err)
-	}
-
-	streamKey := fmt.Sprintf("%d", jobID)
-	log.Printf("Streaming logs from: %s", streamKey)
-
-	// Poll Redis for new entries
-	// TODO: Use go-redis XREAD with BLOCK
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			// Check if step is still running
-			var status string
-			err := r.pool.QueryRow(ctx,
-				"SELECT status FROM step WHERE id = $1", stepID,
-			).Scan(&status)
-			if err != nil {
-				return err
-			}
-
-			if status == "completed" || status == "failed" {
-				return nil
-			}
+// GetStepOutput returns the log output for a step.
+// Strategy (mirrors Java TerraformOutputController.getFile()):
+//  1. Try Redis stream first (job is still running or TTL hasn't expired)
+//  2. Fall back to object storage (job finished, logs uploaded to S3/Azure/GCP)
+func (r *LogStreamReader) GetStepOutput(ctx context.Context, orgID, jobID, stepID string) ([]byte, error) {
+	// 1. Try Redis — stream key is the jobId (matches executor RedisStreamer)
+	if r.redis != nil {
+		data, err := r.readFromRedis(ctx, jobID)
+		if err == nil && len(strings.TrimSpace(string(data))) > 0 {
+			log.Printf("Serving live logs from Redis stream (jobId=%s, stepId=%s, bytes=%d)", jobID, stepID, len(data))
+			return data, nil
+		}
+		if err != nil {
+			log.Printf("Redis read failed for jobId=%s: %v (falling back to storage)", jobID, err)
 		}
 	}
+
+	// 2. Fall back to object storage
+	return r.readFromStorage(orgID, jobID, stepID)
 }
 
-// GetStepOutput tries Redis first, falls back to storage.
-// This matches TerraformOutputController.getFile():
-// 1. Try Redis (always, regardless of step status)
-// 2. Fall back to storage (S3/Azure/GCP)
-func (r *RedisStreamReader) GetStepOutput(ctx context.Context, orgID, jobID, stepID string) ([]byte, error) {
-	// Try Redis first
-	logs, err := r.GetCurrentLogs(ctx, stepID)
-	if err == nil && len(strings.TrimSpace(logs)) > 0 {
-		log.Printf("Reading output from Redis stream for step %s", stepID)
-		return []byte(logs), nil
+// readFromRedis reads all entries from a Redis Stream and returns concatenated log output.
+// Matches the Java LogsConsumer / StreamingService.getCurrentLogs() pattern.
+func (r *LogStreamReader) readFromRedis(ctx context.Context, jobID string) ([]byte, error) {
+	msgs, err := r.redis.XRange(ctx, jobID, "-", "+").Result()
+	if err != nil {
+		return nil, fmt.Errorf("XRange %s: %w", jobID, err)
+	}
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("stream %s is empty or does not exist", jobID)
 	}
 
-	// Fall back to storage
-	log.Printf("Reading output from storage for step %s", stepID)
-	// TODO: Read from storage backend
-	return nil, nil
+	var sb strings.Builder
+	for _, msg := range msgs {
+		// Skip sentinel done messages
+		if _, done := msg.Values["done"]; done {
+			continue
+		}
+		if out, ok := msg.Values["output"]; ok {
+			sb.WriteString(fmt.Sprintf("%v", out))
+			sb.WriteByte('\n')
+		}
+	}
+	return []byte(sb.String()), nil
+}
+
+// readFromStorage downloads the log file from object storage.
+// Path matches executor status.saveOutput(): tfoutput/{orgId}/{jobId}/{stepId}.tfoutput
+func (r *LogStreamReader) readFromStorage(orgID, jobID, stepID string) ([]byte, error) {
+	if r.storage == nil {
+		return nil, fmt.Errorf("no storage configured")
+	}
+
+	path := fmt.Sprintf("tfoutput/%s/%s/%s.tfoutput", orgID, jobID, stepID)
+	log.Printf("Serving logs from storage: %s", path)
+
+	rc, err := r.storage.DownloadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("storage download %s: %w", path, err)
+	}
+	defer rc.Close()
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, fmt.Errorf("reading storage response: %w", err)
+	}
+	return data, nil
 }

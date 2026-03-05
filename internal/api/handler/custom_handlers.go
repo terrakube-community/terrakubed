@@ -1,12 +1,15 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/ilkerispir/terrakubed/internal/api/repository"
+	"github.com/ilkerispir/terrakubed/internal/api/streaming"
 )
 
 // LogsHandler handles the /logs endpoint for Redis log streaming.
@@ -64,14 +67,15 @@ func (h *LogsHandler) AppendLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 // TerraformOutputHandler serves /tfoutput/v1 — returns job step output.
+// Path: /tfoutput/v1/organization/{orgId}/job/{jobId}/step/{stepId}
 type TerraformOutputHandler struct {
-	repo *repository.GenericRepository
-	// storageService and streamingService will be injected later
+	repo      *repository.GenericRepository
+	streaming *streaming.LogStreamReader
 }
 
 // NewTerraformOutputHandler creates a new TerraformOutputHandler.
-func NewTerraformOutputHandler(repo *repository.GenericRepository) *TerraformOutputHandler {
-	return &TerraformOutputHandler{repo: repo}
+func NewTerraformOutputHandler(repo *repository.GenericRepository, streaming *streaming.LogStreamReader) *TerraformOutputHandler {
+	return &TerraformOutputHandler{repo: repo, streaming: streaming}
 }
 
 // GetOutput handles GET /tfoutput/v1/organization/{orgId}/job/{jobId}/step/{stepId}
@@ -80,10 +84,37 @@ func (h *TerraformOutputHandler) GetOutput(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// TODO: Read from Redis stream first, fallback to S3
-	log.Printf("Get output called: %s", r.URL.Path)
+
+	orgID, jobID, stepID, ok := parseTfOutputPath(r.URL.Path)
+	if !ok {
+		http.Error(w, "invalid path — expected /tfoutput/v1/organization/{orgId}/job/{jobId}/step/{stepId}", http.StatusBadRequest)
+		return
+	}
+
+	data, err := h.streaming.GetStepOutput(context.Background(), orgID, jobID, stepID)
+	if err != nil {
+		log.Printf("GetOutput failed (org=%s job=%s step=%s): %v", orgID, jobID, stepID, err)
+		http.Error(w, "output not found", http.StatusNotFound)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+}
+
+// parseTfOutputPath extracts orgId, jobId, stepId from the URL path.
+// Expected: /tfoutput/v1/organization/{orgId}/job/{jobId}/step/{stepId}
+func parseTfOutputPath(path string) (orgID, jobID, stepID string, ok bool) {
+	// Strip prefix
+	path = strings.TrimPrefix(path, "/tfoutput/v1/organization/")
+	// orgId/job/{jobId}/step/{stepId}
+	parts := strings.Split(path, "/")
+	// parts: [orgId, "job", jobId, "step", stepId]
+	if len(parts) != 5 || parts[1] != "job" || parts[3] != "step" {
+		return "", "", "", false
+	}
+	return parts[0], parts[2], parts[4], true
 }
 
 // ContextHandler serves /context/v1 — provides execution context for jobs.

@@ -44,10 +44,12 @@ type Config struct {
 	StorageType             string
 
 	// API Specific
-	DatabaseURL string
-	Hostname    string
-	ApiPort     string
-	OwnerGroup  string
+	DatabaseURL   string
+	Hostname      string
+	ApiPort       string
+	OwnerGroup    string
+	RedisAddress  string
+	RedisPassword string
 }
 
 func getEnvWithFallback(primary, fallback string) string {
@@ -162,6 +164,18 @@ func buildDatabaseURL() string {
 	return u.String()
 }
 
+func buildRedisAddress() string {
+	host := getEnvChain("TerrakubeRedisHostname", "REDIS_HOST")
+	if host == "" {
+		return ""
+	}
+	port := getEnvChain("TerrakubeRedisPort", "REDIS_PORT")
+	if port == "" {
+		port = "6379"
+	}
+	return host + ":" + port
+}
+
 func LoadConfig() (*Config, error) {
 	cfg := &Config{
 		// Registry
@@ -196,10 +210,12 @@ func LoadConfig() (*Config, error) {
 		StorageType:             getStorageType(),
 
 		// API
-		DatabaseURL: buildDatabaseURL(),
-		Hostname:    getEnvWithFallback("TERRAKUBE_HOSTNAME", "TerrakubeHostname"),
-		ApiPort:     getEnv("API_PORT", "8080"),
-		OwnerGroup:  getEnvWithFallback("TERRAKUBE_OWNER", "TerrakubeOwner"),
+		DatabaseURL:   buildDatabaseURL(),
+		Hostname:      getEnvWithFallback("TERRAKUBE_HOSTNAME", "TerrakubeHostname"),
+		ApiPort:       getEnv("API_PORT", "8080"),
+		OwnerGroup:    getEnvWithFallback("TERRAKUBE_OWNER", "TerrakubeOwner"),
+		RedisAddress:  buildRedisAddress(),
+		RedisPassword: getEnvChain("TerrakubeRedisPassword", "REDIS_PASSWORD"),
 	}
 
 	// Override API / Secret if provided by executor envs
