@@ -17,7 +17,7 @@ WORKDIR /app
 
 # Install dependencies required by Registry (git, openssh-client)
 # and Executor (curl, unzip, bash)
-RUN apk add --no-cache git openssh-client curl unzip bash ca-certificates
+RUN apk add --no-cache git openssh-client curl unzip bash ca-certificates jq
 
 # Ensure cache directory exists and is writable for Terraform
 RUN mkdir -p /home/app/.terrakube/terraform-versions && \

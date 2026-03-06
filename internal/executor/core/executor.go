@@ -244,6 +244,11 @@ func (p *JobProcessor) executeTerraform(job *model.TerraformJob, workingDir stri
 		return fmt.Errorf("failed to install terraform %s: %w", job.TerraformVersion, err)
 	}
 
+	// Prepend terraform binary dir to PATH so after/onFailure scripts can call `terraform` directly
+	execDir := filepath.Dir(execPath)
+	currentPath := os.Getenv("PATH")
+	job.EnvironmentVariables["PATH"] = execDir + ":" + currentPath
+
 	if err := p.generateBackendOverride(job, workingDir); err != nil {
 		return fmt.Errorf("failed to generate backend override: %w", err)
 	}
