@@ -71,7 +71,10 @@ func (s *Service) SetCompleted(job *model.TerraformJob, success bool, output str
 func (s *Service) SetPending(job *model.TerraformJob, output string) error {
 	outputPath := s.saveOutput(job.OrganizationId, job.JobId, job.StepId, output)
 
-	if err := s.client.UpdateStepStatus(job.OrganizationId, job.JobId, job.StepId, "pending", outputPath); err != nil {
+	// Step is always "completed" (plan step finished successfully).
+	// Only the JOB is set to "pending" (waiting for user approval to apply).
+	// Matches Java UpdateJobStatusImpl: updateStepStatus sets "completed", updateJobStatus sets "pending".
+	if err := s.client.UpdateStepStatus(job.OrganizationId, job.JobId, job.StepId, "completed", outputPath); err != nil {
 		return fmt.Errorf("failed to update step status: %w", err)
 	}
 	return s.client.UpdateJobStatus(job.OrganizationId, job.JobId, "pending", "")
