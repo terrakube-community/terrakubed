@@ -189,31 +189,11 @@ func (p *JobProcessor) ProcessJob(job *model.TerraformJob) error {
 	}
 
 	// 4. Download Pre-existing State
-	// Primary path matches Java API / TFC migration protocol: tfstate/{orgId}/{wsId}/terraform.tfstate
-	// Fallback path is the legacy Go executor path for backward compatibility.
-	remotePath := fmt.Sprintf("tfstate/%s/%s/terraform.tfstate", job.OrganizationId, job.WorkspaceId)
-	stateReader, err := p.Storage.DownloadFile(remotePath)
-	if err != nil {
-		remotePath = fmt.Sprintf("organization/%s/workspace/%s/state/terraform.tfstate", job.OrganizationId, job.WorkspaceId)
-		stateReader, err = p.Storage.DownloadFile(remotePath)
-		if err != nil {
-			log.Printf("No existing state found (this is normal for new workspaces): %v", err)
-		}
-	}
-	if stateReader != nil {
-		defer stateReader.Close()
-		localStatePath := filepath.Join(workingDir, "terraform.tfstate")
-		f, err := os.Create(localStatePath)
-		if err != nil {
-			log.Printf("Failed to create local state file: %v", err)
-		} else {
-			if _, err := io.Copy(f, stateReader); err != nil {
-				log.Printf("Failed to write state file: %v", err)
-			}
-			f.Close()
-			log.Printf("Downloaded existing state to %s", localStatePath)
-		}
-	}
+	// Try paths in order, skipping empty (0-byte) files which indicate no real state:
+	//   1. tfstate/{orgId}/{wsId}/terraform.tfstate  — primary path (Java API / TFC migration / Go executor v0.0.44+)
+	//   2. tfstate/{orgId}/{wsId}/state/state.raw.json — Go executor post-apply raw state
+	//   3. organization/{orgId}/workspace/{wsId}/state/terraform.tfstate — legacy Go executor path
+	p.downloadState(job, workingDir)
 
 	// 4b. Download Plan for Apply
 	if job.Type == "terraformApply" {
