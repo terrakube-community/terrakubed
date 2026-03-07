@@ -78,13 +78,15 @@ func (p *JobProcessor) uploadStateAndOutput(job *model.TerraformJob, workingDir 
 		}
 	}
 
-	// Upload Plan if exists (terraformPlan)
+	// Upload Plan if exists (terraformPlan / terraformPlanDestroy).
+	// Stored at a job-level path (no step ID) so the apply step can always
+	// find it regardless of its own step ID.
 	planPath := filepath.Join(workingDir, "terraform.tfplan")
 	if _, err := os.Stat(planPath); err == nil {
 		f, err := os.Open(planPath)
 		if err == nil {
 			defer f.Close()
-			remotePath := fmt.Sprintf("organization/%s/workspace/%s/job/%s/step/%s/terraformLibrary.tfplan", job.OrganizationId, job.WorkspaceId, job.JobId, job.StepId)
+			remotePath := fmt.Sprintf("organization/%s/workspace/%s/job/%s/plan/terraformLibrary.tfplan", job.OrganizationId, job.WorkspaceId, job.JobId)
 			if err := p.Storage.UploadFile(remotePath, f); err != nil {
 				log.Printf("Failed to upload plan: %v", err)
 			}

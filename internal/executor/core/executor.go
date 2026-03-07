@@ -214,6 +214,12 @@ func (p *JobProcessor) ProcessJob(job *model.TerraformJob) error {
 		if executionErr != nil {
 			output += "\nError: " + executionErr.Error()
 			p.Status.SetCompleted(job, false, output)
+		} else if job.Type == "approval" {
+			// Approval gate passed: mark this step completed but put the job back
+			// in "queue" so the Java API dispatches the next step (apply / destroy).
+			// Using SetCompleted here would set job="completed" and cause the Java
+			// API to mark all remaining steps as "notExecuted".
+			p.Status.SetApprovalCompleted(job, output)
 		} else {
 			p.Status.SetCompleted(job, true, output)
 		}
@@ -303,8 +309,11 @@ func (p *JobProcessor) executeTerraform(job *model.TerraformJob, workingDir stri
 }
 
 func (p *JobProcessor) downloadPlanForApply(job *model.TerraformJob, workingDir string) {
-	remotePath := fmt.Sprintf("organization/%s/workspace/%s/job/%s/step/%s/terraformLibrary.tfplan",
-		job.OrganizationId, job.WorkspaceId, job.JobId, job.StepId)
+	// Plan is stored at a job-level path (no step ID) — matches the upload path
+	// used by the plan step. Using the apply step's own ID here would always fail
+	// since the plan was created by a different step.
+	remotePath := fmt.Sprintf("organization/%s/workspace/%s/job/%s/plan/terraformLibrary.tfplan",
+		job.OrganizationId, job.WorkspaceId, job.JobId)
 
 	reader, err := p.Storage.DownloadFile(remotePath)
 	if err != nil {

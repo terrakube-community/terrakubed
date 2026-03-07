@@ -16,6 +16,7 @@ type StatusService interface {
 	SetRunning(job *model.TerraformJob) error
 	SetCompleted(job *model.TerraformJob, success bool, output string) error
 	SetPending(job *model.TerraformJob, output string) error
+	SetApprovalCompleted(job *model.TerraformJob, output string) error
 	UpdateCommitId(job *model.TerraformJob, commitId string) error
 	CreateHistory(job *model.TerraformJob, stateURL string) error
 }
@@ -78,6 +79,21 @@ func (s *Service) SetPending(job *model.TerraformJob, output string) error {
 		return fmt.Errorf("failed to update step status: %w", err)
 	}
 	return s.client.UpdateJobStatus(job.OrganizationId, job.JobId, "pending", "")
+}
+
+// SetApprovalCompleted marks the approval gate step as done and returns the job to "queue"
+// so the Java API dispatches the next step (apply / destroy).
+//
+// The key difference from SetCompleted: job status is set to "queue", NOT "completed".
+// Setting job="completed" here would cause the Java API to mark all remaining steps
+// (e.g. terraformApply) as "notExecuted", because it thinks the whole job is finished.
+func (s *Service) SetApprovalCompleted(job *model.TerraformJob, output string) error {
+	outputPath := s.saveOutput(job.OrganizationId, job.JobId, job.StepId, output)
+	if err := s.client.UpdateStepStatus(job.OrganizationId, job.JobId, job.StepId, "completed", outputPath); err != nil {
+		return fmt.Errorf("failed to update approval step status: %w", err)
+	}
+	// Put job back to "queue" so the scheduler picks up the next pending step.
+	return s.client.UpdateJobStatus(job.OrganizationId, job.JobId, "queue", "")
 }
 
 func (s *Service) UpdateCommitId(job *model.TerraformJob, commitId string) error {
