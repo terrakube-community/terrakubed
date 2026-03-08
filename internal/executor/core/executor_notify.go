@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/ilkerispir/terrakubed/internal/model"
 )
@@ -39,8 +40,13 @@ func (p *JobProcessor) slackSend(webhookURL, color, title string, job *model.Ter
 
 	wsText := wsName
 	if uiURL != "" {
-		runURL := fmt.Sprintf("https://%s/organizations/%s/workspaces/%s/runs/%s",
-			uiURL, job.OrganizationId, job.WorkspaceId, job.JobId)
+		// Normalize: add https:// only if no scheme is present
+		baseURL := strings.TrimRight(uiURL, "/")
+		if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+			baseURL = "https://" + baseURL
+		}
+		runURL := fmt.Sprintf("%s/organizations/%s/workspaces/%s/runs/%s",
+			baseURL, job.OrganizationId, job.WorkspaceId, job.JobId)
 		wsText = fmt.Sprintf("<%s|%s>", runURL, wsName)
 	}
 
