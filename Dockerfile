@@ -1,5 +1,10 @@
 # Build Stage
-FROM golang:1.24-alpine AS builder
+# Use BUILDPLATFORM so the builder runs natively (fast cross-compilation via Go,
+# no QEMU emulation needed for the build step).
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 
 WORKDIR /app
 
@@ -8,7 +13,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o terrakubed cmd/terrakubed/main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o terrakubed cmd/terrakubed/main.go
 
 # Final Stage
 FROM alpine:3.19
