@@ -26,11 +26,16 @@ func (p *JobProcessor) slackEnabled(job *model.TerraformJob) (string, bool) {
 
 // slackSend builds and POSTs a minimal Slack attachment message.
 func (p *JobProcessor) slackSend(webhookURL, color, title string, job *model.TerraformJob) {
-	// UI URL: prefer executor config (TerrakubeUiURL / TERRAKUBE_UI_URL on the deployment),
-	// fall back to org-level env var for backward compatibility.
+	// UI URL priority:
+	// 1. TerrakubeUiURL / TERRAKUBE_UI_URL on the executor deployment (explicit)
+	// 2. Org-level TERRAKUBE_UI_URL env var (backward compat)
+	// 3. AzBuilderApiUrl — same host usually serves the UI; avoids needing a separate env var
 	uiURL := p.Config.TerrakubeUiURL
 	if uiURL == "" {
 		uiURL = job.EnvironmentVariables["TERRAKUBE_UI_URL"]
+	}
+	if uiURL == "" {
+		uiURL = p.Config.AzBuilderApiUrl
 	}
 
 	wsName := job.EnvironmentVariables["workspaceName"]
