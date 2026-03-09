@@ -19,19 +19,21 @@ func ZipDirectory(sourceDir, zipPath string) error {
 	archive := zip.NewWriter(zipFile)
 	defer archive.Close()
 
-	info, err := os.Stat(sourceDir)
-	if err != nil {
+	if _, err := os.Stat(sourceDir); err != nil {
 		return err
 	}
 
-	var baseDir string
-	if info.IsDir() {
-		baseDir = filepath.Base(sourceDir)
-	}
+	// Ensure sourceDir ends with a separator so TrimPrefix strips it cleanly
+	sourceDirWithSep := filepath.Clean(sourceDir) + string(filepath.Separator)
 
 	filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
+		}
+
+		// Skip the root directory entry itself
+		if filepath.Clean(path) == filepath.Clean(sourceDir) {
+			return nil
 		}
 
 		header, err := zip.FileInfoHeader(info)
@@ -39,9 +41,9 @@ func ZipDirectory(sourceDir, zipPath string) error {
 			return err
 		}
 
-		if baseDir != "" {
-			header.Name = filepath.Join(baseDir, strings.TrimPrefix(path, sourceDir))
-		}
+		// Store files relative to sourceDir (no top-level directory prefix)
+		// e.g. "variables.tf" not "terraform-aws-nat/variables.tf"
+		header.Name = strings.TrimPrefix(path, sourceDirWithSep)
 
 		if info.IsDir() {
 			header.Name += "/"
