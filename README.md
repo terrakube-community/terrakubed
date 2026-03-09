@@ -1,106 +1,187 @@
 # Terrakubed
 
-**The unified high-performance Go backend for Terrakube.**
+**The unified, high-performance Go backend for [Terrakube](https://github.com/AzBuilder/terrakube).**
 
-> Currently housing the Registry and Executor services, charting the path towards a single-binary IaC platform.
+> A single lightweight binary that replaces the Java executor and registry microservices — fully compatible with the Terrakube Java API.
 
-Terrakubed is the consolidated Go microservices ecosystem for the Terrakube Infrastructure as Code (IaC) platform. By combining multiple core domain models (like Workspaces, Execution, and Registry storage) into a unified codebase, it significantly reduces deployment overhead, speeds up local development, and lays the foundation for a seamless, single-binary architecture.
+[![Release](https://img.shields.io/github/v/release/terrakube-community/terrakubed)](https://github.com/terrakube-community/terrakubed/releases)
+[![Docker Pulls](https://img.shields.io/docker/pulls/terrakubecommunity/terrakubed)](https://hub.docker.com/r/terrakubecommunity/terrakubed)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 ---
 
-## 🚀 Features
+## What is Terrakubed?
 
-- **Consolidated Architecture**: Run multiple Terrakube components from a single, lightweight Go binary.
-- **Provider & Module Registry (v1)**: Fully compliant Terraform/OpenTofu registry protocol for managing your private modules and overriding public providers.
-- **Job Executor**: A dynamic job runner powered by `terraform-exec` that handles automated `plan`, `apply`, and `destroy` operations synchronously or through Kubernetes Jobs.
-- **Dynamic Versioning**: Unlike older Java counterparts, Terrakubed uses `go-version` and `hc-install` to dynamically download and execute the exact version of Terraform/OpenTofu your workspace requires.
-- **Cloud Native Storage**: Built-in native SDKs (AWS S3, Azure Blob, Google Cloud Storage) to persist your Terraform State, Modules, and execution logs securely.
-- **Full Plan/Apply/Destroy Lifecycle**: Supports all four job types — `terraformPlan`, `terraformPlanDestroy`, `terraformApply`, `terraformDestroy` — with correct approval-gate handling.
-- **Built-in Slack Notifications**: Zero-YAML Slack alerts for plan pending approval, apply/destroy success, and failure — driven purely by workspace environment variables.
-- **Resilient State Management**: Robust S3 state download with multi-path fallback and 0-byte file protection, fully compatible with Terraform Cloud migration paths.
+Terrakubed is a Go reimplementation of the Terrakube executor and registry services. It is a **drop-in replacement** for the Java-based `executor` and `registry` containers — no changes to your Terrakube API, UI, or Kubernetes configuration are required.
 
-## 🏗 Architecture
+**Why Go?**
 
-Terrakubed compiles into a single executable that dynamically activates internal component routers based on the `SERVICE_TYPE` environment variable.
+| | Java executor | Terrakubed |
+|---|---|---|
+| Startup time | ~15–30 s (JVM warmup) | < 1 s |
+| Container image size | ~500 MB | ~25 MB |
+| Memory (idle) | ~256–512 MB | ~15 MB |
+| Dynamic TF version install | ❌ (fixed image) | ✅ (downloads on demand) |
+| Terraform CLI remote backend | ✅ | ✅ |
 
-This means you can continue running it as isolated microservices in Kubernetes, or run everything in a single lightweight container.
+---
 
-- `SERVICE_TYPE=executor`: Starts the job polling cycle or the `/api/v1/terraform-rs` webhook listener to run infrastructure pipelines. **This is the Dockerfile default.**
-- `SERVICE_TYPE=registry`: Starts only the `/terraform/modules/v1/` and `/terraform/providers/v1/` REST endpoints.
-- `SERVICE_TYPE=all`: Starts all systems concurrently for a fully embedded local development experience.
+## Features
 
-## ⚙️ Getting Started
+- **Drop-in replacement** — uses the same Terrakube Java API endpoints and environment variables as the official executor/registry containers.
+- **Dynamic Terraform / OpenTofu versioning** — downloads and caches the exact binary version your workspace requires at runtime.
+- **Full job lifecycle** — `terraformPlan`, `terraformPlanDestroy`, `terraformApply`, `terraformDestroy`, `customScripts`, and approval gates.
+- **Terraform CLI remote backend** — run `terraform plan` / `apply` from your local machine using a Terrakube workspace as the remote backend.
+- **Private module & provider registry** — fully compliant with the Terraform registry protocol (`/terraform/modules/v1/` and `/terraform/providers/v1/`).
+- **Multi-cloud state storage** — native SDKs for AWS S3, Azure Blob Storage, and Google Cloud Storage. State is managed directly by the backend (no manual download/upload).
+- **Built-in API service** — optional Go replacement for the Terrakube Java API (PostgreSQL + JSON:API + GraphQL).
+- **Built-in Slack notifications** — zero-YAML alerts for plan pending, no changes, approved, success, and failure.
+- **Live log streaming** — real-time executor logs via Redis pub/sub.
+- **Multi-architecture Docker images** — `linux/amd64` and `linux/arm64`.
 
-### Local Development
+---
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/ilkerispir/terrakubed.git
-   cd terrakubed
-   ```
+## Architecture
 
-2. **Download Dependencies & Build:**
-   ```bash
-   go mod download
-   go build -o terrakubed cmd/terrakubed/main.go
-   ```
+Terrakubed compiles into a **single binary** that activates services based on the `SERVICE_TYPE` environment variable:
 
-3. **Run the Service:**
-   ```bash
-   # Run all embedded services
-   export SERVICE_TYPE=all
-   export PORT=8075
-   ./terrakubed
-   ```
-
-### Docker
-
-A unified multi-stage Dockerfile is provided to package all necessary tools (Git, Bash, OpenSSH, `jq`) and the Go binary into a tiny Alpine image.
-
-```bash
-docker build -t terrakubed:latest .
-docker run -e SERVICE_TYPE=all -p 8075:8075 -p 8090:8090 terrakubed:latest
+```
+SERVICE_TYPE=executor   →  Job runner (ephemeral K8s jobs or polling mode)
+SERVICE_TYPE=registry   →  Terraform module & provider registry
+SERVICE_TYPE=api        →  REST/GraphQL API (Go replacement for the Java API)
+SERVICE_TYPE=all        →  All three services in one process (local dev)
 ```
 
-## 📖 Configuration
+Default ports:
 
-Terrakubed accepts a wide variety of environment variables to configure its storage backends, database connections, and execution paths.
+| Service | Port |
+|---|---|
+| API | 8080 |
+| Registry | 8075 |
+| Executor | 8090 |
 
-### Core Variables
+---
+
+## Getting Started
+
+### Kubernetes (recommended — drop-in replacement)
+
+The most common deployment is to replace only the executor container. Change the image in your executor `Deployment` or Job template:
+
+```yaml
+# In your Terrakube executor Deployment / Job template
+image: terrakubecommunity/terrakubed:v0.1.0
+```
+
+All existing environment variables (storage keys, API URL, secrets) are accepted unchanged.
+
+### Docker Compose (local development)
+
+```bash
+git clone https://github.com/terrakube-community/terrakubed.git
+cd terrakubed
+
+# Run all services (API + Registry + Executor) in one container
+docker run --rm \
+  -e SERVICE_TYPE=all \
+  -e STORAGE_TYPE=LOCAL \
+  -p 8080:8080 \
+  -p 8075:8075 \
+  -p 8090:8090 \
+  terrakubecommunity/terrakubed:v0.1.0
+```
+
+### Build from Source
+
+```bash
+git clone https://github.com/terrakube-community/terrakubed.git
+cd terrakubed
+
+go mod download
+go build -o terrakubed cmd/terrakubed/main.go
+
+SERVICE_TYPE=all ./terrakubed
+```
+
+---
+
+## Configuration
+
+Terrakubed accepts the same environment variables as the official Terrakube Java containers.
+
+### Core
+
+| Variable | Description | Default |
+|---|---|---|
+| `SERVICE_TYPE` | `executor` \| `registry` \| `api` \| `all` | `executor` |
+| `STORAGE_TYPE` | `AWS` \| `AZURE` \| `GCP` \| `LOCAL` | `LOCAL` |
+| `AzBuilderApiUrl` / `TERRAKUBE_API_URL` | Terrakube Java API base URL | `http://localhost:8081` |
+| `InternalSecret` / `TERRAKUBE_INTERNAL_SECRET` | Shared secret for internal JWT tokens | — |
+| `TerrakubeUiURL` / `TERRAKUBE_UI_URL` | UI base URL (used in Slack deep links) | — |
+
+### Storage — AWS S3
 
 | Variable | Description |
 |---|---|
-| `SERVICE_TYPE` | `executor` \| `registry` \| `all` |
-| `STORAGE_TYPE` | `AWS` \| `AZURE` \| `GCP` \| `LOCAL` |
-| `PORT` | Internal port binding |
-| `TERRAKUBE_API_URL` | Path to the core Terrakube Spring Boot API |
-| `TERRAKUBE_UI_URL` or `TerrakubeUiURL` | Terrakube UI base domain (e.g. `app.example.com`) — used to generate deep links in Slack notifications |
-| `AWS_REGION` / `AWS_BUCKET_NAME` | Core AWS Cloud Storage settings (similar for GCP/Azure) |
+| `AwsStorageBucketName` / `AWS_BUCKET_NAME` | S3 bucket name |
+| `AwsStorageRegion` / `AWS_REGION` | AWS region |
+| `AwsStorageAccessKey` / `AWS_ACCESS_KEY_ID` | Access key (omit for IRSA / Pod Identity) |
+| `AwsStorageSecretKey` / `AWS_SECRET_ACCESS_KEY` | Secret key (omit for IRSA / Pod Identity) |
+| `AwsEndpoint` | Custom S3 endpoint (MinIO, Localstack, etc.) |
+| `AwsEnableRoleAuth` | Set `true` to force IAM role auth (skip static keys) |
 
-### Slack Notifications
+### Storage — Azure Blob
 
-Terrakubed has built-in Slack notifications that require **no changes to your workflow YAML**. Configure them via workspace environment variables:
+| Variable | Description |
+|---|---|
+| `AzureStorageAccountName` | Storage account name |
+| `AzureStorageContainerName` | Container name |
+| `AzureStorageAccountKey` | Storage account key |
 
-| Variable | Required | Description |
+### Storage — Google Cloud Storage
+
+| Variable | Description |
+|---|---|
+| `GcpStorageBucketName` | GCS bucket name |
+| `GcpStorageProjectId` | GCP project ID |
+| `GcpStorageCredentials` | Service account JSON (base64-encoded) |
+
+### Registry
+
+| Variable | Description | Default |
 |---|---|---|
-| `SLACK_WEBHOOK_URL` | Yes | Incoming webhook URL for your Slack channel |
-| `ENABLE_SLACK_NOTIFICATIONS` | No | Set to `true` to enable lifecycle notifications (pending, success) |
+| `AzBuilderRegistry` / `TERRAKUBE_REGISTRY_DOMAIN` | Registry base URL | `http://localhost:8075` |
+| `AuthenticationValidationTypeRegistry` | `LOCAL` or `DEX` | `LOCAL` |
+| `DexIssuerUri` / `APP_ISSUER_URI` | OIDC issuer URI (required when using DEX) | — |
 
-**Notification behaviour:**
+### API Service (Go API)
 
-| Event | Trigger | Condition |
-|---|---|---|
-| ⏳ Plan Ready — Awaiting Approval | `ENABLE_SLACK_NOTIFICATIONS=true` | Plan exits with code 2 (changes detected) |
-| 💤 No Changes Detected | `ENABLE_SLACK_NOTIFICATIONS=true` | Plan exits with code 0 |
-| ✅ Approved — Applying / Destroying | `ENABLE_SLACK_NOTIFICATIONS=true` | Apply or destroy begins after approval |
-| 🚀 Apply / Destroy Completed | `ENABLE_SLACK_NOTIFICATIONS=true` | Apply or destroy finishes successfully |
-| 🔴 Failure | `SLACK_WEBHOOK_URL` only | **Any** step failure, regardless of `ENABLE_SLACK_NOTIFICATIONS` |
+| Variable | Description |
+|---|---|
+| `DATABASE_URL` / `DatasourceHostname` | PostgreSQL connection URL or hostname |
+| `DatasourceDatabase` | Database name |
+| `DatasourceUser` | Database user |
+| `DatasourcePassword` | Database password |
+| `DatasourcePort` | Database port (default: `5432`) |
+| `TerrakubeHostname` / `TERRAKUBE_HOSTNAME` | Public hostname for state/TFE URLs |
+| `TerrakubeOwner` / `TERRAKUBE_OWNER` | Owner group name |
+| `PatSecret` | Secret for PAT token signing |
+| `TerrakubeRedisHostname` / `REDIS_HOST` | Redis hostname for live log streaming |
+| `TerrakubeRedisPort` / `REDIS_PORT` | Redis port (default: `6379`) |
+| `TerrakubeRedisPassword` / `REDIS_PASSWORD` | Redis password |
 
-> **Tip:** Set `SLACK_WEBHOOK_URL` globally so failures are always reported, and set `ENABLE_SLACK_NOTIFICATIONS=true` per-workspace (or globally) to get the full lifecycle.
+### Executor — Ephemeral (Kubernetes Jobs)
 
-Each notification includes the workspace name (as a deep link if `TERRAKUBE_UI_URL` is set), the repository source, branch, and Terraform/OpenTofu version.
+The Terrakube Java API creates a K8s Job for each run and passes the job data via environment variable:
 
-## 📋 Workflow Templates
+| Variable | Description |
+|---|---|
+| `EphemeralFlagBatch` / `ExecutorFlagBatch` | Set `true` by the Java API to activate batch (ephemeral) mode |
+| `EphemeralJobData` / `EPHEMERAL_JOB_DATA` | Base64-encoded JSON job payload (set by Java API) |
+
+---
+
+## Workflow Templates
 
 ### Plan Only
 
@@ -137,61 +218,133 @@ flow:
     approval: true
 ```
 
-## 📦 Changelog
+### With Before / After Scripts
 
-### v0.0.51 — Direct cloud storage backend (state persistence fix)
-- **Root cause fixed**: The executor was using a local backend + manual state upload, which could silently lose state if the upload failed. Plan would then show all resources as "to add" on every run.
-- `generateBackendOverride` now writes a real S3 / AzureRM / GCS backend block into `terrakube_override.tf`, matching the Java executor's approach exactly. Terraform reads and writes state directly to cloud storage — no manual download or upload required.
-- `terraform init` now passes `-reconfigure` so it adopts the new backend without prompting for state migration in non-interactive mode.
-- Manual `terraform.tfstate` download/upload removed from `ProcessJob` and `uploadStateAndOutput`.
-- State history JSON now uses a UUID filename (`{UUID}.json`) and the correct history URL format: `{api_url}/tfstate/v1/organization/{orgId}/workspace/{wsId}/state/{UUID}.json` — matching the Java API's `TerraformStatePathService`.
-- Local storage type falls back to a local file backend (unchanged behaviour for local dev).
+```yaml
+flow:
+  - type: "terraformPlan"
+    name: "Plan"
+    step: 100
+    commands:
+      - runtime: "BASH"
+        priority: 10
+        before: true
+        script: |
+          echo "Running before init"
+      - runtime: "BASH"
+        priority: 10
+        after: true
+        script: |
+          echo "Plan complete"
+          terraform version
+          jq --version
+```
 
-### v0.0.50 — Fix apply stuck in queue after approval
-- `SetApprovalCompleted` sets job status to `"pending"` (was `"queue"`).
-- Java API `ScheduleJob` switch: `queue` → default (no-op), `pending` → `executePendingJob()` which dispatches the apply/destroy step.
+---
 
-### v0.0.49 — Fix apply notExecuted after approval gate
-- `approval`-type step now calls `SetApprovalCompleted` instead of `SetCompleted`. `SetCompleted` was setting job=`"completed"`, causing the Java API to mark all remaining steps as `notExecuted`.
-- Plan file stored at job-level path (no step ID): `organization/{orgId}/{wsId}/job/{jobId}/plan/terraformLibrary.tfplan`. Apply step now reliably finds it regardless of its own step ID.
+## Terraform CLI Remote Backend
 
-### v0.0.48 — Use executor config `TerrakubeUiURL` for workspace links
-- Slack `slackSend()` now reads `TerrakubeUiURL` from the executor's deployment config first (`TerrakubeUiURL` / `TERRAKUBE_UI_URL` env on the executor Deployment/Job), then falls back to the workspace-level `TERRAKUBE_UI_URL` env var.
-- No need to set `TERRAKUBE_UI_URL` as a global org env var — if the executor deployment already has it, Slack links work automatically.
+Terrakubed supports running `terraform plan` and `terraform apply` from your **local machine** using a Terrakube workspace as the remote backend — the same workflow as Terraform Cloud's remote operations.
 
-### v0.0.47 — Full Slack notification feature
-- New file `internal/executor/core/executor_notify.go` with a complete, self-contained Slack notification service.
-- Sends Slack block-kit messages with colour coding for plan pending, plan no-changes, approved/starting, success, and failure.
-- Controlled by two workspace env vars: `SLACK_WEBHOOK_URL` and `ENABLE_SLACK_NOTIFICATIONS`.
-- Failure notifications fire on `SLACK_WEBHOOK_URL` alone (no `ENABLE_SLACK_NOTIFICATIONS` guard) so failures are always reported if a webhook is set.
+### Configure your workspace
 
-### v0.0.46 — Auto Slack failure notification
-- Executor automatically POSTs to `SLACK_WEBHOOK_URL` when any terraform step fails.
-- No YAML `onFailure` blocks needed (Java API 2.30.1 does not support `onFailure: true` in `Command`).
+Add this to any `.tf` file in your project (or `backend.tf`):
 
-### v0.0.45 — Resilient state download
-- `downloadState()` now tries three S3 paths in order:
-  1. `tfstate/{orgId}/{wsId}/terraform.tfstate` (primary — Java API / TFC migration path)
-  2. `tfstate/{orgId}/{wsId}/state/state.raw.json` (raw state fallback)
-  3. `organization/{orgId}/workspace/{wsId}/state/terraform.tfstate` (legacy Go executor path)
-- Files that download as 0 bytes are skipped and the next candidate is tried.
-- `uploadStateAndOutput()` never writes a 0-byte `terraform.tfstate` back to S3, preventing good state from being overwritten by an empty file.
+```hcl
+terraform {
+  backend "remote" {
+    hostname     = "terrakube-api.example.com"
+    organization = "my-org"
 
-### v0.0.44 — S3 state path aligned with Java API
-- State is now uploaded to `tfstate/{orgId}/{wsId}/terraform.tfstate`, matching the path used by the Terrakube Java API and the TFC migration protocol.
-- Workspaces migrated from Terraform Cloud will no longer show all resources as "to add" on the first plan.
+    workspaces {
+      name = "my-workspace"
+    }
+  }
+}
+```
 
-### v0.0.43 — `jq` and `terraform` available in scripts
-- `jq` added to the Docker image (`apk add jq`).
-- Terraform binary directory prepended to `PATH` in `EnvironmentVariables` before scripts run, so `after`/`before` scripts can call `terraform` and `jq` directly without full paths.
+### Authenticate
 
-### v0.0.42 — `terraformPlanDestroy` support
-- The executor now handles the `terraformPlanDestroy` job type, enabling the full destroy-with-approval flow: `terraformPlanDestroy` → approval gate → `terraformApply` (which applies the saved destroy plan).
+```bash
+terraform login terrakube-api.example.com
+```
 
-## 🤝 Contributing
+### Run
 
-We welcome contributions! As we unify more of the Terrakube ecosystem into Go, there are many opportunities to help optimize our Terraform execution engine, expand storage drivers, and enhance API reliability. Please read our [Contribution Guide](../CONTRIBUTING.md) for more details.
+```bash
+terraform init
+terraform plan    # executes in Terrakube, streams logs to your terminal
+terraform apply
+```
 
-## 📄 License
+The Terraform CLI uploads your local configuration to Terrakube, which runs the job in Kubernetes and streams the output back to your terminal in real time.
 
-This project is licensed under the Apache License 2.0.
+---
+
+## Slack Notifications
+
+Terrakubed has built-in Slack notifications that require **no changes to your workflow YAML**. Configure them via workspace environment variables:
+
+| Variable | Required | Description |
+|---|---|---|
+| `SLACK_WEBHOOK_URL` | Yes | Incoming webhook URL for your Slack channel |
+| `ENABLE_SLACK_NOTIFICATIONS` | No | Set to `true` to enable full lifecycle notifications |
+
+### Notification events
+
+| Event | Trigger |
+|---|---|
+| ⏳ Plan Ready — Awaiting Approval | `ENABLE_SLACK_NOTIFICATIONS=true` + plan has changes (exit 2) |
+| 💤 No Changes Detected | `ENABLE_SLACK_NOTIFICATIONS=true` + plan has no changes (exit 0) |
+| ✅ Approved — Applying / Destroying | `ENABLE_SLACK_NOTIFICATIONS=true` + apply/destroy starts |
+| 🚀 Apply / Destroy Completed | `ENABLE_SLACK_NOTIFICATIONS=true` + apply/destroy succeeds |
+| 🔴 Failure | `SLACK_WEBHOOK_URL` set (regardless of `ENABLE_SLACK_NOTIFICATIONS`) |
+
+> **Tip:** Set `SLACK_WEBHOOK_URL` globally so failures are always reported, and enable `ENABLE_SLACK_NOTIFICATIONS=true` per workspace for full lifecycle visibility.
+
+Each notification includes the workspace name (with a deep link to the UI if `TerrakubeUiURL` is set), the repository source, branch, and Terraform/OpenTofu version.
+
+---
+
+## Kubernetes RBAC
+
+If you run Terrakubed as an ephemeral executor (K8s Job per run), apply the bundled RBAC manifests so the executor pod can read its own job data:
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/terrakube-community/terrakubed/main/ephemeral-executor-config/service_account.yml
+kubectl apply -f https://raw.githubusercontent.com/terrakube-community/terrakubed/main/ephemeral-executor-config/rbac_role.yml
+kubectl apply -f https://raw.githubusercontent.com/terrakube-community/terrakubed/main/ephemeral-executor-config/rbac_role_binding.yml
+```
+
+These files are adapted from the upstream Terrakube project and are kept in sync.
+
+---
+
+## Compatibility
+
+Terrakubed is tested against the **Terrakube Java API v2.27+**. It uses the same:
+
+- REST endpoints (`/api/v1/`, `/logs/`, `/tfoutput/v1/`, `/context/v1/`)
+- State storage paths (`tfstate/{orgId}/{wsId}/terraform.tfstate`)
+- Plan file paths (`organization/{orgId}/workspace/{wsId}/job/{jobId}/plan/terraformLibrary.tfplan`)
+- Job status values (`running`, `pending`, `completed`, `failed`, `queue`)
+- Ephemeral job payload format (`EphemeralJobData` base64 JSON)
+
+---
+
+## Contributing
+
+Contributions are welcome! Please open an issue or pull request on [GitHub](https://github.com/terrakube-community/terrakubed).
+
+Areas where help is appreciated:
+
+- Additional storage backends
+- OpenTofu registry protocol enhancements
+- Improved test coverage
+- Documentation and examples
+
+---
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE) for details.
