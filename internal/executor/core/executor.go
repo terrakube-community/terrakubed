@@ -228,7 +228,15 @@ func (p *JobProcessor) ProcessJob(job *model.TerraformJob) error {
 	defer streamer.Close()
 
 	// 3. Setup Workspace
-	ws := workspace.NewWorkspace(job)
+	// For CLI-driven runs (branch == "remote-content") the workspace downloads a tar.gz
+	// from the API. Generate a short-lived Terrakube token for that HTTP request.
+	var apiToken string
+	if p.Config.InternalSecret != "" {
+		if t, err := auth.GenerateTerrakubeToken(p.Config.InternalSecret); err == nil {
+			apiToken = t
+		}
+	}
+	ws := workspace.NewWorkspace(job, apiToken)
 	workingDir, err := ws.Setup()
 	if err != nil {
 		p.Status.SetCompleted(job, false, err.Error())

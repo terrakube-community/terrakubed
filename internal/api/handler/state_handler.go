@@ -145,11 +145,12 @@ func (h *TerraformStateHandler) uploadHostedState(w http.ResponseWriter, r *http
 type RemoteTFEHandler struct {
 	pool     *pgxpool.Pool
 	hostname string
+	storage  storage.StorageService
 }
 
 // NewRemoteTFEHandler creates a new handler.
-func NewRemoteTFEHandler(pool *pgxpool.Pool, hostname string) *RemoteTFEHandler {
-	return &RemoteTFEHandler{pool: pool, hostname: hostname}
+func NewRemoteTFEHandler(pool *pgxpool.Pool, hostname string, storageSvc storage.StorageService) *RemoteTFEHandler {
+	return &RemoteTFEHandler{pool: pool, hostname: hostname, storage: storageSvc}
 }
 
 // ServeHTTP routes /remote/tfe/v2/ requests.
@@ -327,17 +328,96 @@ func (h *RemoteTFEHandler) handlePlans(w http.ResponseWriter, r *http.Request, p
 }
 
 func (h *RemoteTFEHandler) handleConfigVersions(w http.ResponseWriter, r *http.Request, path string) {
-	log.Printf("TFE config-versions endpoint: %s %s", r.Method, path)
-	// PUT for uploading config — just accept it
-	if r.Method == http.MethodPut {
-		body, _ := io.ReadAll(r.Body)
+	// path examples:
+	//   "configuration-versions"                              → POST  (create)
+	//   "configuration-versions/<id>"                         → PUT   (upload tar.gz)
+	//   "configuration-versions/<id>/terraformContent.tar.gz" → GET   (download tar.gz)
+	log.Printf("TFE config-versions: %s %s", r.Method, path)
+
+	parts := strings.SplitN(strings.TrimPrefix(path, "configuration-versions"), "/", 3)
+	// parts[0] is always "" (prefix stripped), parts[1] is the ID (if present), parts[2] is suffix
+
+	// POST /remote/tfe/v2/configuration-versions — create a new config version
+	if r.Method == http.MethodPost && (len(parts) < 2 || parts[1] == "") {
+		id := uuid.New().String()
+		uploadURL := fmt.Sprintf("https://%s/remote/tfe/v2/configuration-versions/%s", h.hostname, id)
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": map[string]interface{}{
+				"id":   id,
+				"type": "configuration-versions",
+				"attributes": map[string]interface{}{
+					"status":     "pending",
+					"upload-url": uploadURL,
+				},
+			},
+		})
+		return
+	}
+
+	if len(parts) < 2 || parts[1] == "" {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+
+	id := parts[1]
+	suffix := ""
+	if len(parts) == 3 {
+		suffix = parts[2]
+	}
+
+	storageKey := fmt.Sprintf("cli-uploads/%s/content.tar.gz", id)
+
+	// PUT /remote/tfe/v2/configuration-versions/<id> — receive and store the tar.gz
+	if r.Method == http.MethodPut && suffix == "" {
+		body, err := io.ReadAll(r.Body)
 		defer r.Body.Close()
-		log.Printf("Config version upload: %d bytes", len(body))
+		if err != nil {
+			http.Error(w, "Failed to read body", http.StatusBadRequest)
+			return
+		}
+		if err := h.storage.UploadFile(storageKey, bytes.NewReader(body)); err != nil {
+			log.Printf("Config version upload failed (%s): %v", id, err)
+			http.Error(w, "Failed to store config", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("Config version stored: id=%s (%d bytes) → %s", id, len(body), storageKey)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{"data": nil})
+
+	// GET /remote/tfe/v2/configuration-versions/<id>/terraformContent.tar.gz — serve tar.gz
+	if r.Method == http.MethodGet && suffix == "terraformContent.tar.gz" {
+		reader, err := h.storage.DownloadFile(storageKey)
+		if err != nil {
+			log.Printf("Config version not found (%s): %v", id, err)
+			http.Error(w, "Config version not found", http.StatusNotFound)
+			return
+		}
+		defer reader.Close()
+		w.Header().Set("Content-Type", "application/gzip")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.tar.gz\"", id))
+		w.WriteHeader(http.StatusOK)
+		io.Copy(w, reader)
+		return
+	}
+
+	// GET /remote/tfe/v2/configuration-versions/<id> — return status
+	if r.Method == http.MethodGet {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": map[string]interface{}{
+				"id":   id,
+				"type": "configuration-versions",
+				"attributes": map[string]interface{}{
+					"status": "uploaded",
+				},
+			},
+		})
+		return
+	}
+
+	http.Error(w, "Not found", http.StatusNotFound)
 }
 
 // ──────────────────────────────────────────────────

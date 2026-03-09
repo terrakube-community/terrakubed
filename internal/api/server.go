@@ -94,7 +94,7 @@ func NewServer(config Config) (*Server, error) {
 
 	// State & TFE handlers
 	stateHandler := handler.NewTerraformStateHandler(db.Pool, config.Hostname, storageService)
-	tfeHandler := handler.NewRemoteTFEHandler(db.Pool, config.Hostname)
+	tfeHandler := handler.NewRemoteTFEHandler(db.Pool, config.Hostname, storageService)
 	wellKnownHandler := handler.NewWellKnownHandler(config.Hostname)
 
 	// Set up routes
