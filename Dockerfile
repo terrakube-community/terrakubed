@@ -1,0 +1,41 @@
+# Build Stage
+# Use BUILDPLATFORM so the builder runs natively (fast cross-compilation via Go,
+# no QEMU emulation needed for the build step).
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o terrakubed cmd/terrakubed/main.go
+
+# Final Stage
+FROM alpine:3.19
+
+WORKDIR /app
+
+# Install dependencies required by Registry (git, openssh-client)
+# and Executor (curl, unzip, bash)
+RUN apk add --no-cache git openssh-client curl unzip bash ca-certificates jq
+
+# Ensure cache directory exists and is writable for Terraform
+RUN mkdir -p /home/app/.terrakube/terraform-versions && \
+  chmod -R 777 /home/app
+
+COPY --from=builder /app/terrakubed .
+
+# Expose all service ports
+EXPOSE 8080
+EXPOSE 8075
+EXPOSE 8090
+
+# Default to executor service type (can be overridden via env)
+ENV SERVICE_TYPE=executor
+
+CMD ["./terrakubed"]

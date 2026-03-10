@@ -30,3 +30,12 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# MacOS
+.DS_Store
+
+# Terrakube repo
+terrakube-repo/
+
+# Claude Code
+.claude
