@@ -1,71 +1,195 @@
 package core
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
-	tfjson "github.com/hashicorp/terraform-json"
+	"github.com/terrakube-community/terrakubed/internal/auth"
 	"github.com/terrakube-community/terrakubed/internal/executor/terraform"
 	"github.com/terrakube-community/terrakubed/internal/model"
 )
 
-// planContext is the JSON structure stored at tfplan/{jobId}/context.json.
-type planContext struct {
-	ResourceChanges []*tfjson.ResourceChange  `json:"resourceChanges"`
-	OutputChanges   map[string]*tfjson.Change `json:"outputChanges"`
-	Summary         PlanSummary               `json:"summary"`
+const (
+	structuredPlanMarker = `<div data-terrakube-structured-plan="true"></div>`
+	contextPlanKey       = "planStructuredOutput"
+	contextUIKey         = "terrakubeUI"
+)
+
+func normalizeAction(actions []interface{}) string {
+	has := func(s string) bool {
+		for _, a := range actions {
+			if v, ok := a.(string); ok && v == s {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has("delete") && has("create"):
+		return "replace"
+	case has("create"):
+		return "create"
+	case has("delete"):
+		return "delete"
+	case has("update"):
+		return "update"
+	case has("read"):
+		return "read"
+	case has("no-op"):
+		return "no-op"
+	default:
+		return "unknown"
+	}
 }
 
-func (p *JobProcessor) uploadPlanJSON(job *model.TerraformJob, workingDir string, execPath string) {
-	tfExecutor := terraform.NewExecutor(job, workingDir, nil, execPath)
-	plan, err := tfExecutor.ShowPlanJSON()
-	if err != nil {
-		log.Printf("Failed to parse plan JSON (skipping context upload): %v", err)
-		return
+func buildChangesFromPlanJSON(planJSON string) ([]map[string]interface{}, error) {
+	var plan map[string]interface{}
+	if err := json.Unmarshal([]byte(planJSON), &plan); err != nil {
+		return nil, fmt.Errorf("failed to parse plan JSON: %w", err)
 	}
 
-	var summary PlanSummary
-	for _, rc := range plan.ResourceChanges {
-		if rc.Change == nil {
+	resourceChanges, _ := plan["resource_changes"].([]interface{})
+	var result []map[string]interface{}
+
+	for _, rc := range resourceChanges {
+		change, ok := rc.(map[string]interface{})
+		if !ok {
 			continue
 		}
-		actions := rc.Change.Actions
-		switch {
-		case actions.Create():
-			summary.Add++
-		case actions.Delete():
-			summary.Destroy++
-		case actions.Update():
-			summary.Change++
-		case actions.Replace():
-			summary.Replace++
+		changeBlock, ok := change["change"].(map[string]interface{})
+		if !ok {
+			continue
 		}
+		actions, _ := changeBlock["actions"].([]interface{})
+		action := normalizeAction(actions)
+		if action == "no-op" {
+			continue
+		}
+		result = append(result, map[string]interface{}{
+			"address":         change["address"],
+			"moduleAddress":   change["module_address"],
+			"resourceType":    change["type"],
+			"resourceName":    change["name"],
+			"actions":         actions,
+			"action":          action,
+			"before":          changeBlock["before"],
+			"beforeSensitive": changeBlock["before_sensitive"],
+			"after":           changeBlock["after"],
+			"afterSensitive":  changeBlock["after_sensitive"],
+			"afterUnknown":    changeBlock["after_unknown"],
+		})
+	}
+	return result, nil
+}
+
+func (p *JobProcessor) getCurrentContext(jobId string) map[string]interface{} {
+	token, err := auth.GenerateTerrakubeToken(p.Config.InternalSecret)
+	if err != nil {
+		log.Printf("Failed to generate token for context GET: %v", err)
+		return map[string]interface{}{}
 	}
 
-	ctx := planContext{
-		ResourceChanges: plan.ResourceChanges,
-		OutputChanges:   plan.OutputChanges,
-		Summary:         summary,
+	url := fmt.Sprintf("%s/context/v1/%s", p.Config.AzBuilderApiUrl, jobId)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return map[string]interface{}{}
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Failed to GET context for job %s: %v", jobId, err)
+		return map[string]interface{}{}
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var ctx map[string]interface{}
+	if err := json.Unmarshal(body, &ctx); err != nil || ctx == nil {
+		return map[string]interface{}{}
+	}
+	return ctx
+}
+
+func (p *JobProcessor) saveContext(jobId string, ctx map[string]interface{}) error {
+	token, err := auth.GenerateTerrakubeToken(p.Config.InternalSecret)
+	if err != nil {
+		return fmt.Errorf("failed to generate token for context POST: %w", err)
 	}
 
 	data, err := json.Marshal(ctx)
 	if err != nil {
-		log.Printf("Failed to marshal plan context JSON: %v", err)
+		return fmt.Errorf("failed to marshal context: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/context/v1/%s", p.Config.AzBuilderApiUrl, jobId)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("failed to build context POST request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to POST context for job %s: %w", jobId, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("context POST returned %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+func (p *JobProcessor) uploadPlanJSON(job *model.TerraformJob, workingDir string, execPath string) {
+	tfExecutor := terraform.NewExecutor(job, workingDir, nil, execPath)
+	planJSON, err := tfExecutor.ShowPlanRawJSON()
+	if err != nil {
+		log.Printf("Failed to get plan JSON (skipping context upload): %v", err)
 		return
 	}
 
-	remotePath := fmt.Sprintf("tfplan/%s/context.json", job.JobId)
-	if err := p.Storage.UploadFile(remotePath, strings.NewReader(string(data))); err != nil {
-		log.Printf("Failed to upload plan context JSON: %v", err)
+	changes, err := buildChangesFromPlanJSON(planJSON)
+	if err != nil {
+		log.Printf("Failed to build changes from plan JSON: %v", err)
 		return
 	}
-	log.Printf("Uploaded plan context JSON to %s (add=%d change=%d destroy=%d replace=%d)",
-		remotePath, summary.Add, summary.Change, summary.Destroy, summary.Replace)
+
+	ctx := p.getCurrentContext(job.JobId)
+
+	planOutput, _ := ctx[contextPlanKey].(map[string]interface{})
+	if planOutput == nil {
+		planOutput = map[string]interface{}{}
+	}
+	planOutput[job.StepId] = changes
+	ctx[contextPlanKey] = planOutput
+
+	uiOutput, _ := ctx[contextUIKey].(map[string]interface{})
+	if uiOutput == nil {
+		uiOutput = map[string]interface{}{}
+	}
+	uiOutput[job.StepId] = structuredPlanMarker
+	ctx[contextUIKey] = uiOutput
+
+	if err := p.saveContext(job.JobId, ctx); err != nil {
+		log.Printf("Failed to save plan context for job %s: %v", job.JobId, err)
+		return
+	}
+	log.Printf("Saved structured plan context for job %s step %s (%d changes)", job.JobId, job.StepId, len(changes))
 }
 
 func (p *JobProcessor) uploadStateAndOutput(job *model.TerraformJob, workingDir string) {

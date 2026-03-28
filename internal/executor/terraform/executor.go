@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 
 	"github.com/hashicorp/terraform-exec/tfexec"
-	tfjson "github.com/hashicorp/terraform-json"
 	"github.com/terrakube-community/terrakubed/internal/executor/logs"
 	"github.com/terrakube-community/terrakubed/internal/model"
 )
@@ -229,16 +228,21 @@ func (e *Executor) ShowState() (string, error) {
 	return string(bytes), nil
 }
 
-func (e *Executor) ShowPlanJSON() (*tfjson.Plan, error) {
-	tf, err := tfexec.NewTerraform(e.WorkingDir, e.ExecPath)
-	if err != nil {
-		return nil, fmt.Errorf("error running NewTerraform: %w", err)
-	}
-	env := e.buildEnvMap()
-	tf.SetEnv(env)
-	// No streaming — we need clean JSON output captured internally by tfexec
+func (e *Executor) ShowPlanRawJSON() (string, error) {
 	planFile := filepath.Join(e.WorkingDir, "terraform.tfplan")
-	return tf.ShowPlanFile(context.Background(), planFile)
+	cmd := exec.Command(e.ExecPath, "show", "-json", planFile)
+	cmd.Dir = e.WorkingDir
+	envMap := e.buildEnvMap()
+	envSlice := make([]string, 0, len(envMap))
+	for k, v := range envMap {
+		envSlice = append(envSlice, k+"="+v)
+	}
+	cmd.Env = envSlice
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("terraform show -json failed: %w", err)
+	}
+	return string(output), nil
 }
 
 func (e *Executor) StatePull() (string, error) {
