@@ -1,7 +1,6 @@
 package terraform
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"os"
@@ -10,8 +9,6 @@ import (
 	"runtime"
 
 	"github.com/hashicorp/go-version"
-	"github.com/hashicorp/hc-install/product"
-	"github.com/hashicorp/hc-install/releases"
 )
 
 type VersionManager struct {
@@ -43,27 +40,47 @@ func (vm *VersionManager) Install(ver string, tofu bool) (string, error) {
 }
 
 func (vm *VersionManager) installTerraform(ver string) (string, error) {
-	ctx := context.Background()
-
-	_, err := version.NewVersion(ver)
-	if err != nil {
+	if _, err := version.NewVersion(ver); err != nil {
 		return "", fmt.Errorf("invalid terraform version %s: %w", ver, err)
 	}
 
-	log.Printf("Locating Terraform version %s...", ver)
+	installDir := filepath.Join(vm.CacheDir, fmt.Sprintf("terraform-%s", ver))
+	execPath := filepath.Join(installDir, "terraform")
 
-	installer := &releases.ExactVersion{
-		Product:    product.Terraform,
-		Version:    version.Must(version.NewVersion(ver)),
-		InstallDir: vm.CacheDir,
+	// Return cached binary if already present
+	if _, err := os.Stat(execPath); err == nil {
+		log.Printf("Terraform %s found at: %s", ver, execPath)
+		return execPath, nil
 	}
 
-	execPath, err := installer.Install(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to install terraform %s: %w", ver, err)
+	log.Printf("Installing Terraform version %s...", ver)
+
+	if err := os.MkdirAll(installDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create install dir: %w", err)
 	}
 
-	log.Printf("Terraform %s found at: %s", ver, execPath)
+	url := fmt.Sprintf(
+		"https://releases.hashicorp.com/terraform/%s/terraform_%s_%s_%s.zip",
+		ver, ver, runtime.GOOS, runtime.GOARCH,
+	)
+	zipPath := filepath.Join(installDir, "terraform.zip")
+
+	cmd := exec.Command("curl", "-sL", "-o", zipPath, url)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("failed to download Terraform %s: %s: %w", ver, string(output), err)
+	}
+
+	cmd = exec.Command("unzip", "-o", "-d", installDir, zipPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("failed to extract Terraform %s: %s: %w", ver, string(output), err)
+	}
+	os.Remove(zipPath)
+
+	if err := os.Chmod(execPath, 0755); err != nil {
+		return "", fmt.Errorf("failed to chmod terraform: %w", err)
+	}
+
+	log.Printf("Terraform %s installed at: %s", ver, execPath)
 	return execPath, nil
 }
 
