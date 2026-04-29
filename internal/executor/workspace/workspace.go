@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ type Workspace struct {
 	Job        *model.TerraformJob
 	WorkingDir string
 	apiToken   string // used for downloading remote-content (CLI) uploads
+	sshKeyPath string // persisted SSH key for terraform init module downloads
 }
 
 func NewWorkspace(job *model.TerraformJob, apiToken string) *Workspace {
@@ -35,6 +37,13 @@ func NewWorkspace(job *model.TerraformJob, apiToken string) *Workspace {
 func (w *Workspace) Setup() (string, error) {
 	if w.Job.Branch == "remote-content" {
 		return w.setupFromTarGz()
+	}
+
+	// Persist SSH key so terraform init can also use it when downloading modules.
+	// git.CloneWorkspace writes the key to a temp dir and cleans it up after clone,
+	// so by the time terraform init runs the key is gone. We keep a separate copy.
+	if err := w.persistSSHKey(); err != nil {
+		log.Printf("Warning: failed to persist SSH key for terraform init: %v", err)
 	}
 
 	gitSvc := git.NewService()
@@ -147,7 +156,55 @@ func extractTarGz(r io.Reader, destDir string) error {
 	return nil
 }
 
+// persistSSHKey writes the VCS SSH key to a temp file that outlives the git
+// clone so that subprocesses spawned by terraform init (e.g. git clone for
+// module sources) can also authenticate. The path is injected into the job's
+// EnvironmentVariables as GIT_SSH_COMMAND, which terraform-exec propagates to
+// every git subprocess it launches.
+func (w *Workspace) persistSSHKey() error {
+	if !strings.HasPrefix(w.Job.VcsType, "SSH") || w.Job.AccessToken == "" {
+		return nil
+	}
+
+	// Derive key filename from VCS type (e.g. "SSH~id_ed25519" → "id_ed25519")
+	keyName := "id_rsa"
+	if parts := strings.SplitN(w.Job.VcsType, "~", 2); len(parts) == 2 && parts[1] != "" {
+		keyName = parts[1]
+	}
+
+	keyFile, err := os.CreateTemp("", fmt.Sprintf("terrakube-ssh-%s-*", keyName))
+	if err != nil {
+		return fmt.Errorf("create temp key file: %w", err)
+	}
+	defer keyFile.Close()
+
+	if err := os.Chmod(keyFile.Name(), 0600); err != nil {
+		return fmt.Errorf("chmod key file: %w", err)
+	}
+	if _, err := keyFile.WriteString(w.Job.AccessToken); err != nil {
+		return fmt.Errorf("write key file: %w", err)
+	}
+
+	w.sshKeyPath = keyFile.Name()
+
+	// Inject into job env so terraform and any git subprocess it spawns use this key.
+	// StrictHostKeyChecking=no avoids known_hosts issues in ephemeral pod environments.
+	if w.Job.EnvironmentVariables == nil {
+		w.Job.EnvironmentVariables = make(map[string]string)
+	}
+	w.Job.EnvironmentVariables["GIT_SSH_COMMAND"] = fmt.Sprintf(
+		"ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+		w.sshKeyPath,
+	)
+
+	log.Printf("SSH key persisted for terraform module downloads: %s", w.sshKeyPath)
+	return nil
+}
+
 func (w *Workspace) Cleanup() error {
+	if w.sshKeyPath != "" {
+		os.Remove(w.sshKeyPath)
+	}
 	if w.WorkingDir != "" {
 		return os.RemoveAll(w.WorkingDir)
 	}
