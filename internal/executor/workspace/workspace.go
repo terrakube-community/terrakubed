@@ -201,6 +201,10 @@ func (w *Workspace) persistSSHKey() error {
 	if err := os.Chmod(keyFile.Name(), 0600); err != nil {
 		return fmt.Errorf("chmod key file: %w", err)
 	}
+	// Ensure key ends with newline — some SSH implementations reject keys that don't.
+	if !strings.HasSuffix(keyContent, "\n") {
+		keyContent += "\n"
+	}
 	if _, err := keyFile.WriteString(keyContent); err != nil {
 		return fmt.Errorf("write key file: %w", err)
 	}
