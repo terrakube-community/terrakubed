@@ -156,23 +156,43 @@ func extractTarGz(r io.Reader, destDir string) error {
 	return nil
 }
 
-// persistSSHKey writes the VCS SSH key to a temp file that outlives the git
-// clone so that subprocesses spawned by terraform init (e.g. git clone for
-// module sources) can also authenticate. The path is injected into the job's
-// EnvironmentVariables as GIT_SSH_COMMAND, which terraform-exec propagates to
-// every git subprocess it launches.
+// persistSSHKey writes the appropriate SSH key to a temp file that outlives
+// the git clone so that subprocesses spawned by terraform init (e.g. git
+// clone for module sources) can also authenticate.
+//
+// Mirrors the Java executor's three-case logic in TerraformExecutorServiceImpl:
+//   1. SSH VCS + moduleSshKey  → use moduleSshKey  (separate key for modules)
+//   2. SSH VCS only            → use the VCS key
+//   3. non-SSH VCS + moduleSshKey → use moduleSshKey
+//   4. neither                 → nothing to do
+//
+// The key path is injected into EnvironmentVariables as GIT_SSH_COMMAND so
+// buildEnvMap() propagates it to every subprocess terraform launches.
 func (w *Workspace) persistSSHKey() error {
-	if !strings.HasPrefix(w.Job.VcsType, "SSH") || w.Job.AccessToken == "" {
+	var keyContent string
+
+	switch {
+	case strings.HasPrefix(w.Job.VcsType, "SSH") && w.Job.ModuleSshKey != "":
+		// Case 1: SSH VCS + dedicated module key → prefer module key
+		keyContent = w.Job.ModuleSshKey
+		log.Printf("Using dedicated module SSH key for terraform init (case 1)")
+
+	case strings.HasPrefix(w.Job.VcsType, "SSH") && w.Job.AccessToken != "":
+		// Case 2: SSH VCS only → reuse the VCS key
+		keyContent = w.Job.AccessToken
+		log.Printf("Reusing VCS SSH key for terraform init (case 2)")
+
+	case w.Job.ModuleSshKey != "":
+		// Case 3: HTTPS VCS but module key provided → use module key
+		keyContent = w.Job.ModuleSshKey
+		log.Printf("Using module SSH key for terraform init with HTTPS VCS (case 3)")
+
+	default:
+		// Case 4: no SSH key needed
 		return nil
 	}
 
-	// Derive key filename from VCS type (e.g. "SSH~id_ed25519" → "id_ed25519")
-	keyName := "id_rsa"
-	if parts := strings.SplitN(w.Job.VcsType, "~", 2); len(parts) == 2 && parts[1] != "" {
-		keyName = parts[1]
-	}
-
-	keyFile, err := os.CreateTemp("", fmt.Sprintf("terrakube-ssh-%s-*", keyName))
+	keyFile, err := os.CreateTemp("", "terrakube-ssh-*")
 	if err != nil {
 		return fmt.Errorf("create temp key file: %w", err)
 	}
@@ -181,7 +201,7 @@ func (w *Workspace) persistSSHKey() error {
 	if err := os.Chmod(keyFile.Name(), 0600); err != nil {
 		return fmt.Errorf("chmod key file: %w", err)
 	}
-	if _, err := keyFile.WriteString(w.Job.AccessToken); err != nil {
+	if _, err := keyFile.WriteString(keyContent); err != nil {
 		return fmt.Errorf("write key file: %w", err)
 	}
 
