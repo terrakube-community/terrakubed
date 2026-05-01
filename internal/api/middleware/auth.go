@@ -186,12 +186,10 @@ func AuthMiddleware(config AuthConfig) func(http.Handler) http.Handler {
 					return
 				}
 			default:
-				// Dex/OIDC token — verify with OIDC provider
-				// For now, we trust the JWT format and validate expiry.
-				// Full OIDC verification (JWK validation) will be added when
-				// we integrate with the OIDC discovery endpoint.
-				if claims.Expiry > 0 && time.Now().Unix() > claims.Expiry {
-					http.Error(w, `{"errors":[{"status":"401","title":"Unauthorized","detail":"Token expired"}]}`, http.StatusUnauthorized)
+				// Dex/OIDC token — verify signature with JWKS from issuer
+				if err := verifyOIDCToken(token, config.DexIssuerURI); err != nil {
+					log.Printf("OIDC token verification failed: %v", err)
+					http.Error(w, `{"errors":[{"status":"401","title":"Unauthorized","detail":"Invalid OIDC token"}]}`, http.StatusUnauthorized)
 					return
 				}
 			}
