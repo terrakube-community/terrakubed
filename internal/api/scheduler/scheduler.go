@@ -97,7 +97,9 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT j.id, j.status, j.tcl, j.commit_id,
 		       j.organization_id, j.workspace_id, j.refresh, j.refresh_only,
-		       w.source, w.branch, w.folder, w.terraform_version, w.iac_type,
+		       COALESCE(NULLIF(j.override_source,''), w.source),
+		       COALESCE(NULLIF(j.override_branch,''), w.branch),
+		       w.folder, w.terraform_version, w.iac_type,
 		       w.module_ssh_key,
 		       COALESCE(v.vcs_type,''), COALESCE(v.connection_type,''), COALESCE(v.access_token,'')
 		FROM job j
