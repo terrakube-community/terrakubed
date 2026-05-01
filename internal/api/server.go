@@ -114,6 +114,9 @@ func NewServer(config Config) (*Server, error) {
 	tfeHandler := handler.NewRemoteTFEHandler(db.Pool, config.Hostname, storageService)
 	wellKnownHandler := handler.NewWellKnownHandler(config.Hostname)
 
+	// Module and provider registry
+	registryHandler := handler.NewRegistryHandler(db.Pool, config.Hostname, storageService)
+
 	// Set up routes
 	mux := http.NewServeMux()
 
@@ -149,6 +152,9 @@ func NewServer(config Config) (*Server, error) {
 	mux.Handle("/tfstate/v1/", stateHandler)
 	mux.Handle("/remote/tfe/v2/", tfeHandler)
 	mux.Handle("/.well-known/terraform.json", wellKnownHandler)
+
+	// Module and provider registry
+	mux.Handle("/registry/v1/", registryHandler)
 
 	// Health check — compatible with Spring Boot actuator probes
 	healthHandler := func(w http.ResponseWriter, r *http.Request) {
