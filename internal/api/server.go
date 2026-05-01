@@ -144,6 +144,10 @@ func NewServer(config Config) (*Server, error) {
 	webhookHandler := handler.NewWebhookHandler(db.Pool)
 	mux.Handle("/webhook/v1/", webhookHandler)
 
+	// VCS OAuth callback (GitHub, GitLab, Bitbucket token exchange)
+	vcsCallbackHandler := handler.NewVCSCallbackHandler(db.Pool, config.Hostname, config.UIURL)
+	mux.Handle("/callback/v1/", vcsCallbackHandler)
+
 	// Approval endpoints (approve/reject plan before apply)
 	approvalHandler := handler.NewApprovalHandler(db.Pool)
 	mux.Handle("/approval/v1/", approvalHandler)

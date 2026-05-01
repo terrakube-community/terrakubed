@@ -100,6 +100,12 @@ func startAPI(cfg *config.Config) {
 		StorageType:    cfg.StorageType,
 		RedisAddress:   cfg.RedisAddress,
 		RedisPassword:  cfg.RedisPassword,
+
+		// Kubernetes executor (used by Go API job scheduler)
+		ExecutorNamespace:      cfg.ExecutorNamespace,
+		ExecutorImage:          cfg.ExecutorImage,
+		ExecutorSecretName:     cfg.ExecutorSecretName,
+		ExecutorServiceAccount: cfg.ExecutorServiceAccount,
 	}
 
 	server, err := api.NewServer(apiConfig)
