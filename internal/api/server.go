@@ -71,7 +71,7 @@ func NewServer(config Config) (*Server, error) {
 	// Create JSON:API handler (with TCL lifecycle hook)
 	jsonapiHandler := handler.NewJSONAPIHandler(repo).WithPool(db.Pool)
 
-	// Create custom handlers
+	// Create custom handlers (Redis wired in after Redis client is created)
 	logsHandler := handler.NewLogsHandler(repo)
 
 	// Create storage service
@@ -101,6 +101,11 @@ func NewServer(config Config) (*Server, error) {
 	}
 
 	logStreamer := streaming.NewLogStreamReader(redisClient, storageService)
+
+	// Wire Redis into the logs handler (enables live log append from Java executor)
+	if redisClient != nil {
+		logsHandler.WithRedis(redisClient)
+	}
 
 	outputHandler := handler.NewTerraformOutputHandler(repo, logStreamer)
 
