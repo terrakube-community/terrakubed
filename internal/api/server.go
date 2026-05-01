@@ -17,6 +17,7 @@ import (
 	"github.com/terrakube-community/terrakubed/internal/api/scheduler"
 	"github.com/terrakube-community/terrakubed/internal/api/streaming"
 	"github.com/terrakube-community/terrakubed/internal/api/tcl"
+	"github.com/terrakube-community/terrakubed/internal/api/vcs"
 	"github.com/terrakube-community/terrakubed/internal/storage"
 )
 
@@ -43,12 +44,13 @@ type Config struct {
 
 // Server is the main API server.
 type Server struct {
-	config         Config
-	db             *database.Pool
-	repo           *repository.GenericRepository
-	handler        http.Handler
-	scheduler      *scheduler.JobScheduler
-	schedulePoller *scheduler.SchedulePoller
+	config           Config
+	db               *database.Pool
+	repo             *repository.GenericRepository
+	handler          http.Handler
+	scheduler        *scheduler.JobScheduler
+	schedulePoller   *scheduler.SchedulePoller
+	tokenRefresher   *vcs.TokenRefresher
 }
 
 // NewServer creates a new API server.
@@ -204,6 +206,9 @@ func NewServer(config Config) (*Server, error) {
 	tclProc := tcl.NewProcessor(db.Pool)
 	schedulePoller := scheduler.NewSchedulePoller(db.Pool, tclProc)
 
+	// VCS token refresher: keeps OAuth tokens alive for GitLab/Bitbucket
+	tokenRefresher := vcs.NewTokenRefresher(db.Pool)
+
 	return &Server{
 		config:         config,
 		db:             db,
@@ -211,6 +216,7 @@ func NewServer(config Config) (*Server, error) {
 		handler:        finalHandler,
 		scheduler:      jobScheduler,
 		schedulePoller: schedulePoller,
+		tokenRefresher: tokenRefresher,
 	}, nil
 }
 
@@ -226,6 +232,10 @@ func (s *Server) Start() error {
 	if s.schedulePoller != nil {
 		go s.schedulePoller.Start(ctx)
 		log.Printf("Schedule poller started (sync interval: 60s)")
+	}
+
+	if s.tokenRefresher != nil {
+		go s.tokenRefresher.Start(ctx)
 	}
 
 	addr := fmt.Sprintf(":%d", s.config.Port)
