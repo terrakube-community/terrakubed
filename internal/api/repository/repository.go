@@ -37,6 +37,10 @@ type ResourceMeta struct {
 	SoftDeleteColumn string
 	// Default values for columns when not provided during creation
 	DefaultValues map[string]interface{}
+	// Sensitive masking: when SensitiveFlagColumn is true, SensitiveMaskColumns are blanked in responses.
+	// Used for variable.value and globalvar.value when sensitive = true.
+	SensitiveFlagColumn  string
+	SensitiveMaskColumns []string
 }
 
 // ParentRelation describes a ManyToOne/OneToOne FK relationship.
@@ -255,7 +259,16 @@ func (r *GenericRepository) List(ctx context.Context, resourceType string, param
 	}
 	defer rows.Close()
 
-	return scanRows(rows, selectCols)
+	results, err := scanRows(rows, selectCols)
+	if err != nil {
+		return nil, err
+	}
+	if meta.SensitiveFlagColumn != "" {
+		for _, row := range results {
+			maskSensitive(row, meta.SensitiveFlagColumn, meta.SensitiveMaskColumns)
+		}
+	}
+	return results, nil
 }
 
 // FindByID returns a single row by primary key.
@@ -289,7 +302,11 @@ func (r *GenericRepository) FindByID(ctx context.Context, resourceType string, i
 	if len(results) == 0 {
 		return nil, nil // Not found
 	}
-	return results[0], nil
+	row := results[0]
+	if meta.SensitiveFlagColumn != "" {
+		maskSensitive(row, meta.SensitiveFlagColumn, meta.SensitiveMaskColumns)
+	}
+	return row, nil
 }
 
 // Create inserts a new row and returns the generated ID.
@@ -428,4 +445,24 @@ func scanRows(rows pgx.Rows, columns []string) ([]map[string]interface{}, error)
 	}
 
 	return results, nil
+}
+
+// maskSensitive blanks SensitiveMaskColumns in a row when the SensitiveFlagColumn is true.
+// This prevents secret variable values from being returned in API responses.
+func maskSensitive(row map[string]interface{}, flagCol string, maskCols []string) {
+	if len(maskCols) == 0 {
+		return
+	}
+	isSensitive := false
+	switch v := row[flagCol].(type) {
+	case bool:
+		isSensitive = v
+	case *bool:
+		isSensitive = v != nil && *v
+	}
+	if isSensitive {
+		for _, col := range maskCols {
+			row[col] = ""
+		}
+	}
 }

@@ -237,16 +237,21 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			"UPDATE step SET status = 'running' WHERE id = $1", stepID)
 		_, _ = s.pool.Exec(ctx,
 			"UPDATE job SET status = 'running' WHERE id = $1", jobID)
+		// Lock the workspace for the duration of the run to prevent concurrent executions
+		_, _ = s.pool.Exec(ctx,
+			"UPDATE workspace SET locked = true WHERE id = $1", workspaceID)
 
-		go func(jID int, sID string, ec *ExecutionContext) {
+		go func(jID int, sID, wsID string, ec *ExecutionContext) {
 			if err := s.executor.Execute(ctx, ec); err != nil {
 				log.Printf("Job %d step %s failed: %v", jID, sID, err)
 				s.pool.Exec(ctx, "UPDATE step SET status = 'failed' WHERE id = $1", sID)
 				s.pool.Exec(ctx, "UPDATE job SET status = 'failed' WHERE id = $1", jID)
+				// Unlock workspace on executor failure so future jobs can run
+				s.pool.Exec(ctx, "UPDATE workspace SET locked = false WHERE id = $1", wsID)
 			}
-			// Note: executor pod updates status via API callbacks when it completes.
-			// advanceOrComplete is called by the status handler, not here.
-		}(jobID, stepID, execCtx)
+			// On success: executor pod updates status via API callbacks when it completes.
+			// maybeUnlockWorkspace is called after the final step completes.
+		}(jobID, stepID, workspaceID, execCtx)
 	}
 }
 
@@ -277,6 +282,7 @@ func (s *JobScheduler) resolveStepType(jobTCL string, stepNumber int) string {
 }
 
 // maybeCompleteJob marks a job as completed if all steps are done (no pending/running).
+// It also unlocks the workspace so future jobs can be dispatched.
 func (s *JobScheduler) maybeCompleteJob(ctx context.Context, jobID int) {
 	var pending int
 	s.pool.QueryRow(ctx,
@@ -297,6 +303,12 @@ func (s *JobScheduler) maybeCompleteJob(ctx context.Context, jobID int) {
 		}
 		s.pool.Exec(ctx, "UPDATE job SET status = $1 WHERE id = $2", finalStatus, jobID)
 		log.Printf("Job %d %s", jobID, finalStatus)
+
+		// Unlock the workspace now the run is complete
+		s.pool.Exec(ctx, `
+			UPDATE workspace SET locked = false
+			WHERE id = (SELECT workspace_id FROM job WHERE id = $1)
+		`, jobID)
 	}
 }
 

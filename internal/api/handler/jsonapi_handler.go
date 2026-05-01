@@ -124,17 +124,27 @@ func (h *JSONAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// /api/v1/{type}/{id} — Get, Update, or Delete
 		h.handleResource(w, r, segments[0], segments[1])
 	case len(segments) == 3:
-		// /api/v1/{type}/{id}/{relationship} — List related
+		// /api/v1/{type}/{id}/{relationship} — List related or create child
 		h.handleRelated(w, r, segments[0], segments[1], segments[2])
 	case len(segments) == 4 && segments[2] == "relationships":
 		// /api/v1/{type}/{id}/relationships/{rel} — Relationship link
 		h.handleRelationshipLink(w, r, segments[0], segments[1], segments[3])
-	case len(segments) == 4:
-		// /api/v1/{parentType}/{parentId}/{childType}/{childId}
-		// Nested resource access: resolve child by its ID directly
-		h.handleResource(w, r, segments[2], segments[3])
 	default:
-		writeError(w, http.StatusNotFound, "Invalid path")
+		// Deep nesting: /api/v1/{t0}/{id0}/{t1}/{id1}[/{t2}/{id2}...]
+		// Elide-style: find the last type/id pair and operate on it.
+		// If odd number of segments after /api/v1/, last segment is a relationship.
+		if len(segments)%2 == 0 {
+			// Even → last pair is the target resource
+			innerType := segments[len(segments)-2]
+			innerID := segments[len(segments)-1]
+			h.handleResource(w, r, innerType, innerID)
+		} else {
+			// Odd → last segment is a relationship on the penultimate resource
+			parentType := segments[len(segments)-3]
+			parentID := segments[len(segments)-2]
+			relName := segments[len(segments)-1]
+			h.handleRelated(w, r, parentType, parentID, relName)
+		}
 	}
 }
 
