@@ -177,11 +177,24 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 
 		// ── approval step ────────────────────────────────────────────────────
 		if stepType == "approval" {
-			_, _ = s.pool.Exec(ctx,
-				"UPDATE step SET status = 'waitingApproval' WHERE id = $1", stepID)
-			_, _ = s.pool.Exec(ctx,
-				"UPDATE job SET status = 'waitingApproval' WHERE id = $1", jobID)
-			log.Printf("Job %d waiting for approval (step %s)", jobID, stepID)
+			// Check if workspace has auto-apply enabled — skip approval if so
+			var autoApply bool
+			s.pool.QueryRow(ctx,
+				"SELECT COALESCE(auto_apply, false) FROM workspace WHERE id = $1", workspaceID,
+			).Scan(&autoApply)
+
+			if autoApply {
+				log.Printf("Job %d auto-apply: skipping approval step %s", jobID, stepID)
+				_, _ = s.pool.Exec(ctx,
+					"UPDATE step SET status = 'notExecuted' WHERE id = $1", stepID)
+				s.advanceOrComplete(ctx, jobID)
+			} else {
+				_, _ = s.pool.Exec(ctx,
+					"UPDATE step SET status = 'waitingApproval' WHERE id = $1", stepID)
+				_, _ = s.pool.Exec(ctx,
+					"UPDATE job SET status = 'waitingApproval' WHERE id = $1", jobID)
+				log.Printf("Job %d waiting for approval (step %s)", jobID, stepID)
+			}
 			continue
 		}
 

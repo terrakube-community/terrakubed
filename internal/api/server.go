@@ -16,6 +16,7 @@ import (
 	"github.com/terrakube-community/terrakubed/internal/api/repository"
 	"github.com/terrakube-community/terrakubed/internal/api/scheduler"
 	"github.com/terrakube-community/terrakubed/internal/api/streaming"
+	"github.com/terrakube-community/terrakubed/internal/api/tcl"
 	"github.com/terrakube-community/terrakubed/internal/storage"
 )
 
@@ -42,11 +43,12 @@ type Config struct {
 
 // Server is the main API server.
 type Server struct {
-	config    Config
-	db        *database.Pool
-	repo      *repository.GenericRepository
-	handler   http.Handler
-	scheduler *scheduler.JobScheduler
+	config         Config
+	db             *database.Pool
+	repo           *repository.GenericRepository
+	handler        http.Handler
+	scheduler      *scheduler.JobScheduler
+	schedulePoller *scheduler.SchedulePoller
 }
 
 // NewServer creates a new API server.
@@ -183,20 +185,32 @@ func NewServer(config Config) (*Server, error) {
 		jobScheduler = scheduler.NewJobScheduler(db.Pool, executor, 5*time.Second)
 	}
 
+	// Schedule poller: watches workspace schedules and triggers cron jobs
+	tclProc := tcl.NewProcessor(db.Pool)
+	schedulePoller := scheduler.NewSchedulePoller(db.Pool, tclProc)
+
 	return &Server{
-		config:    config,
-		db:        db,
-		repo:      repo,
-		handler:   finalHandler,
-		scheduler: jobScheduler,
+		config:         config,
+		db:             db,
+		repo:           repo,
+		handler:        finalHandler,
+		scheduler:      jobScheduler,
+		schedulePoller: schedulePoller,
 	}, nil
 }
 
 // Start starts the HTTP server and background services.
 func (s *Server) Start() error {
+	ctx := context.Background()
+
 	if s.scheduler != nil {
-		go s.scheduler.Start(context.Background())
+		go s.scheduler.Start(ctx)
 		log.Printf("Job scheduler started (poll interval: 5s)")
+	}
+
+	if s.schedulePoller != nil {
+		go s.schedulePoller.Start(ctx)
+		log.Printf("Schedule poller started (sync interval: 60s)")
 	}
 
 	addr := fmt.Sprintf(":%d", s.config.Port)
