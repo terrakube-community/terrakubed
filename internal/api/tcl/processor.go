@@ -133,3 +133,12 @@ func parseTCL(encoded string) (*FlowConfig, error) {
 
 	return &cfg, nil
 }
+
+// ParseFlow is the exported version of parseTCL for use by the scheduler.
+func ParseFlow(encoded string) ([]Flow, error) {
+	cfg, err := parseTCL(encoded)
+	if err != nil {
+		return nil, err
+	}
+	return cfg.Flow, nil
+}

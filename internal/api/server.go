@@ -134,6 +134,10 @@ func NewServer(config Config) (*Server, error) {
 	webhookHandler := handler.NewWebhookHandler(db.Pool)
 	mux.Handle("/webhook/v1/", webhookHandler)
 
+	// Approval endpoints (approve/reject plan before apply)
+	approvalHandler := handler.NewApprovalHandler(db.Pool)
+	mux.Handle("/approval/v1/", approvalHandler)
+
 	// State & TFE endpoints
 	mux.Handle("/tfstate/v1/", stateHandler)
 	mux.Handle("/remote/tfe/v2/", tfeHandler)
