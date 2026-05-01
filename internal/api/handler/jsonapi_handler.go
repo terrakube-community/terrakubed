@@ -10,14 +10,17 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/terrakube-community/terrakubed/internal/api/jsonapi"
 	"github.com/terrakube-community/terrakubed/internal/api/repository"
+	"github.com/terrakube-community/terrakubed/internal/api/tcl"
 )
 
 // JSONAPIHandler handles generic JSON:API requests for all resource types.
 type JSONAPIHandler struct {
-	repo    *repository.GenericRepository
-	configs map[string]*jsonapi.ResourceConfig
+	repo         *repository.GenericRepository
+	configs      map[string]*jsonapi.ResourceConfig
+	tclProcessor *tcl.Processor
 }
 
 // NewJSONAPIHandler creates a new handler.
@@ -27,6 +30,12 @@ func NewJSONAPIHandler(repo *repository.GenericRepository) *JSONAPIHandler {
 		configs: make(map[string]*jsonapi.ResourceConfig),
 	}
 	h.buildConfigs()
+	return h
+}
+
+// WithPool wires the DB pool for lifecycle hooks (TCL step init, etc.).
+func (h *JSONAPIHandler) WithPool(pool *pgxpool.Pool) *JSONAPIHandler {
+	h.tclProcessor = tcl.NewProcessor(pool)
 	return h
 }
 
@@ -467,6 +476,18 @@ func (h *JSONAPIHandler) createResource(w http.ResponseWriter, r *http.Request, 
 		log.Printf("Error creating %s: %v", resourceType, err)
 		writeError(w, http.StatusInternalServerError, "Failed to create resource")
 		return
+	}
+
+	// Post-create lifecycle hook: initialise TCL steps for new jobs
+	if resourceType == "job" && h.tclProcessor != nil {
+		jobID, _ := strconv.Atoi(fmt.Sprintf("%v", id))
+		if jobID > 0 {
+			go func() {
+				if err := h.tclProcessor.InitJobSteps(r.Context(), jobID); err != nil {
+					log.Printf("TCL step init failed for job %d: %v", jobID, err)
+				}
+			}()
+		}
 	}
 
 	// Reload and return

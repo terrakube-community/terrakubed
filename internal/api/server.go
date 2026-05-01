@@ -66,8 +66,8 @@ func NewServer(config Config) (*Server, error) {
 	// Validate model columns against actual DB schema
 	repo.ValidateColumns(ctx)
 
-	// Create JSON:API handler
-	jsonapiHandler := handler.NewJSONAPIHandler(repo)
+	// Create JSON:API handler (with TCL lifecycle hook)
+	jsonapiHandler := handler.NewJSONAPIHandler(repo).WithPool(db.Pool)
 
 	// Create custom handlers
 	logsHandler := handler.NewLogsHandler(repo)
@@ -129,6 +129,10 @@ func NewServer(config Config) (*Server, error) {
 	mux.Handle("/pat/v1/", patHandler)
 	mux.Handle("/access-token/v1/teams", teamTokenHandler)
 	mux.Handle("/access-token/v1/teams/", teamTokenHandler)
+
+	// VCS webhook endpoints (GitHub, GitLab, Bitbucket)
+	webhookHandler := handler.NewWebhookHandler(db.Pool)
+	mux.Handle("/webhook/v1/", webhookHandler)
 
 	// State & TFE endpoints
 	mux.Handle("/tfstate/v1/", stateHandler)
