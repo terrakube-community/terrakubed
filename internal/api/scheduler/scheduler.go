@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/terrakube-community/terrakubed/internal/api/tcl"
+	"github.com/terrakube-community/terrakubed/internal/api/vcs"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -240,6 +241,8 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		// Lock the workspace for the duration of the run to prevent concurrent executions
 		_, _ = s.pool.Exec(ctx,
 			"UPDATE workspace SET locked = true WHERE id = $1", workspaceID)
+		// Post "pending" commit status at the start of a run
+		go s.postCommitStatusForStep(ctx, jobID, stepType)
 
 		go func(jID int, sID, wsID string, ec *ExecutionContext) {
 			if err := s.executor.Execute(ctx, ec); err != nil {
@@ -282,7 +285,7 @@ func (s *JobScheduler) resolveStepType(jobTCL string, stepNumber int) string {
 }
 
 // maybeCompleteJob marks a job as completed if all steps are done (no pending/running).
-// It also unlocks the workspace so future jobs can be dispatched.
+// It also unlocks the workspace and posts commit status back to the VCS provider.
 func (s *JobScheduler) maybeCompleteJob(ctx context.Context, jobID int) {
 	var pending int
 	s.pool.QueryRow(ctx,
@@ -309,6 +312,79 @@ func (s *JobScheduler) maybeCompleteJob(ctx context.Context, jobID int) {
 			UPDATE workspace SET locked = false
 			WHERE id = (SELECT workspace_id FROM job WHERE id = $1)
 		`, jobID)
+
+		// Post commit status back to VCS provider (async, best-effort)
+		go s.postCommitStatus(ctx, jobID, finalStatus)
+	}
+}
+
+// postCommitStatusForStep posts "pending" commit status when a step starts.
+func (s *JobScheduler) postCommitStatusForStep(ctx context.Context, jobID int, stepType string) {
+	var commitID, source, vcsType, accessToken string
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(j.commit_id,''), COALESCE(w.source,''),
+		       COALESCE(v.vcs_type,''), COALESCE(v.access_token,'')
+		FROM job j
+		JOIN workspace w ON j.workspace_id = w.id
+		LEFT JOIN vcs v ON w.vcs_id = v.id
+		WHERE j.id = $1
+	`, jobID).Scan(&commitID, &source, &vcsType, &accessToken)
+	if err != nil || commitID == "" || vcsType == "" {
+		return
+	}
+
+	context := "terrakube/plan"
+	if stepType == "terraformApply" || stepType == "terraformDestroy" {
+		context = "terrakube/apply"
+	}
+
+	cs := vcs.CommitStatus{
+		VCSType:     vcsType,
+		AccessToken: accessToken,
+		RepoRef:     source,
+		CommitSHA:   commitID,
+		State:       vcs.StatePending,
+		Description: fmt.Sprintf("Terrakube %s running", stepType),
+		Context:     context,
+	}
+	if err := vcs.PostStatus(cs); err != nil {
+		log.Printf("Job %d: failed to post pending commit status: %v", jobID, err)
+	}
+}
+
+// postCommitStatus looks up the job's VCS config and posts a commit status update.
+func (s *JobScheduler) postCommitStatus(ctx context.Context, jobID int, finalStatus string) {
+	var commitID, source, vcsType, accessToken string
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(j.commit_id,''), COALESCE(w.source,''),
+		       COALESCE(v.vcs_type,''), COALESCE(v.access_token,'')
+		FROM job j
+		JOIN workspace w ON j.workspace_id = w.id
+		LEFT JOIN vcs v ON w.vcs_id = v.id
+		WHERE j.id = $1
+	`, jobID).Scan(&commitID, &source, &vcsType, &accessToken)
+	if err != nil || commitID == "" || vcsType == "" {
+		return // Not a VCS-backed run or no commit SHA
+	}
+
+	state := vcs.StateSuccess
+	description := "Terrakube run completed"
+	if finalStatus == "failed" {
+		state = vcs.StateFailure
+		description = "Terrakube run failed"
+	}
+
+	cs := vcs.CommitStatus{
+		VCSType:     vcsType,
+		AccessToken: accessToken,
+		RepoRef:     source,
+		CommitSHA:   commitID,
+		State:       state,
+		Description: description,
+		Context:     "terrakube/run",
+	}
+	if err := vcs.PostStatus(cs); err != nil {
+		log.Printf("Job %d: failed to post commit status to %s: %v", jobID, vcsType, err)
 	}
 }
 
