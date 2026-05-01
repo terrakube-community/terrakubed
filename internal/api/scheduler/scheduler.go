@@ -2,12 +2,19 @@ package scheduler
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 // JobScheduler polls for pending jobs and dispatches them to an executor.
@@ -268,43 +275,143 @@ type EphemeralConfig struct {
 }
 
 // EphemeralExecutor creates Kubernetes Jobs for each execution.
+// Mirrors Java's EphemeralExecutorService behaviour.
 type EphemeralExecutor struct {
-	config EphemeralConfig
+	config    EphemeralConfig
+	clientset *kubernetes.Clientset
 }
 
 // NewEphemeralExecutor creates a new ephemeral executor.
-func NewEphemeralExecutor(config EphemeralConfig) *EphemeralExecutor {
-	return &EphemeralExecutor{config: config}
+// It auto-detects in-cluster config and falls back to kubeconfig.
+func NewEphemeralExecutor(config EphemeralConfig) (*EphemeralExecutor, error) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		// Fall back to kubeconfig (local dev / out-of-cluster)
+		cfg, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			clientcmd.NewDefaultClientConfigLoadingRules(),
+			&clientcmd.ConfigOverrides{},
+		).ClientConfig()
+		if err != nil {
+			return nil, fmt.Errorf("failed to build k8s config: %w", err)
+		}
+	}
+
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create k8s client: %w", err)
+	}
+
+	return &EphemeralExecutor{config: config, clientset: clientset}, nil
 }
 
-// Execute creates a K8s Job for the given execution context.
+// Execute creates a Kubernetes Job for the given execution context.
+// The job runs the terrakubed executor image with the serialised
+// ExecutionContext passed as EphemeralJobData (base64-encoded JSON).
 func (e *EphemeralExecutor) Execute(ctx context.Context, execCtx *ExecutionContext) error {
 	jobName := fmt.Sprintf("terrakube-job-%d-%s", execCtx.JobID, execCtx.StepID[:8])
 
-	// Serialize execution context for the ephemeral pod
 	execData, err := json.Marshal(execCtx)
 	if err != nil {
 		return fmt.Errorf("failed to serialize execution context: %w", err)
 	}
+	execB64 := base64.StdEncoding.EncodeToString(execData)
 
-	log.Printf("Creating K8s Job: %s (namespace: %s, image: %s)", jobName, e.config.Namespace, e.config.Image)
-	log.Printf("Execution context size: %d bytes", len(execData))
+	ttl := int32(30)
+	backoff := int32(0)
+	privileged := false
 
-	// K8s Job creation will use the existing Go executor's K8s client
-	// or the fabric8-equivalent Go library (k8s.io/client-go).
-	// For now, we log what would be created.
-	//
-	// The job spec matches Java's EphemeralExecutorService:
-	// - Container image: e.config.Image
-	// - Env from secret: e.config.SecretName
-	// - Env var: EphemeralJobData = base64(execData)
-	// - ServiceAccount: e.config.ServiceAccount
-	// - NodeSelector: e.config.NodeSelector
-	// - Tolerations: e.config.Tolerations
-	// - TTL after finished: 30s
-	// - RestartPolicy: Never
-	// - Labels: terrakube.io/organization, terrakube.io/workspace
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: e.config.Namespace,
+			Labels: map[string]string{
+				"terrakube.io/organization": execCtx.OrganizationID,
+				"terrakube.io/workspace":    execCtx.WorkspaceID,
+				"terrakube.io/job":          fmt.Sprintf("%d", execCtx.JobID),
+				"app":                       "terrakubed-executor",
+			},
+			Annotations: e.config.Annotations,
+		},
+		Spec: batchv1.JobSpec{
+			TTLSecondsAfterFinished: &ttl,
+			BackoffLimit:            &backoff,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app":                       "terrakubed-executor",
+						"terrakube.io/organization": execCtx.OrganizationID,
+						"terrakube.io/workspace":    execCtx.WorkspaceID,
+					},
+					Annotations: e.config.Annotations,
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: e.config.ServiceAccount,
+					RestartPolicy:      corev1.RestartPolicyNever,
+					NodeSelector:       e.config.NodeSelector,
+					Tolerations:        e.buildTolerations(),
+					Containers: []corev1.Container{
+						{
+							Name:            "executor",
+							Image:           e.config.Image,
+							ImagePullPolicy: corev1.PullAlways,
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: &privileged,
+							},
+							Env: []corev1.EnvVar{
+								{
+									Name:  "EphemeralJobData",
+									Value: execB64,
+								},
+							},
+							EnvFrom: e.buildEnvFrom(),
+						},
+					},
+				},
+			},
+		},
+	}
 
-	log.Printf("K8s Job %s created successfully (stub — will use k8s.io/client-go)", jobName)
+	_, err = e.clientset.BatchV1().Jobs(e.config.Namespace).Create(ctx, job, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create k8s job %s: %w", jobName, err)
+	}
+
+	log.Printf("K8s Job created: %s (namespace: %s)", jobName, e.config.Namespace)
 	return nil
+}
+
+func (e *EphemeralExecutor) buildEnvFrom() []corev1.EnvFromSource {
+	if e.config.SecretName == "" {
+		return nil
+	}
+	return []corev1.EnvFromSource{
+		{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: e.config.SecretName,
+				},
+			},
+		},
+	}
+}
+
+func (e *EphemeralExecutor) buildTolerations() []corev1.Toleration {
+	var tolerations []corev1.Toleration
+	for _, t := range e.config.Tolerations {
+		toleration := corev1.Toleration{}
+		if v, ok := t["key"]; ok {
+			toleration.Key = v
+		}
+		if v, ok := t["operator"]; ok {
+			toleration.Operator = corev1.TolerationOperator(v)
+		}
+		if v, ok := t["value"]; ok {
+			toleration.Value = v
+		}
+		if v, ok := t["effect"]; ok {
+			toleration.Effect = corev1.TaintEffect(v)
+		}
+		tolerations = append(tolerations, toleration)
+	}
+	return tolerations
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/terrakube-community/terrakubed/internal/api/middleware"
 	"github.com/terrakube-community/terrakubed/internal/api/registry"
 	"github.com/terrakube-community/terrakubed/internal/api/repository"
+	"github.com/terrakube-community/terrakubed/internal/api/scheduler"
 	"github.com/terrakube-community/terrakubed/internal/api/streaming"
 	"github.com/terrakube-community/terrakubed/internal/storage"
 )
@@ -30,14 +32,21 @@ type Config struct {
 	StorageType    string
 	RedisAddress   string
 	RedisPassword  string
+
+	// Kubernetes executor config
+	ExecutorNamespace      string
+	ExecutorImage          string
+	ExecutorSecretName     string
+	ExecutorServiceAccount string
 }
 
 // Server is the main API server.
 type Server struct {
-	config  Config
-	db      *database.Pool
-	repo    *repository.GenericRepository
-	handler http.Handler
+	config    Config
+	db        *database.Pool
+	repo      *repository.GenericRepository
+	handler   http.Handler
+	scheduler *scheduler.JobScheduler
 }
 
 // NewServer creates a new API server.
@@ -150,16 +159,38 @@ func NewServer(config Config) (*Server, error) {
 	finalHandler = middleware.AuthMiddleware(authConfig)(finalHandler)
 	finalHandler = middleware.CORSMiddleware(config.UIURL)(finalHandler)
 
+	// Set up job scheduler with Kubernetes executor
+	executor, err := scheduler.NewEphemeralExecutor(scheduler.EphemeralConfig{
+		Namespace:      config.ExecutorNamespace,
+		Image:          config.ExecutorImage,
+		SecretName:     config.ExecutorSecretName,
+		ServiceAccount: config.ExecutorServiceAccount,
+	})
+	if err != nil {
+		log.Printf("Warning: failed to create K8s executor (%v) — job scheduling disabled", err)
+	}
+
+	var jobScheduler *scheduler.JobScheduler
+	if executor != nil {
+		jobScheduler = scheduler.NewJobScheduler(db.Pool, executor, 5*time.Second)
+	}
+
 	return &Server{
-		config:  config,
-		db:      db,
-		repo:    repo,
-		handler: finalHandler,
+		config:    config,
+		db:        db,
+		repo:      repo,
+		handler:   finalHandler,
+		scheduler: jobScheduler,
 	}, nil
 }
 
-// Start starts the HTTP server.
+// Start starts the HTTP server and background services.
 func (s *Server) Start() error {
+	if s.scheduler != nil {
+		go s.scheduler.Start(context.Background())
+		log.Printf("Job scheduler started (poll interval: 5s)")
+	}
+
 	addr := fmt.Sprintf(":%d", s.config.Port)
 	log.Printf("API server starting on %s", addr)
 	return http.ListenAndServe(addr, s.handler)
