@@ -153,7 +153,8 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		JOIN workspace w ON j.workspace_id = w.id
 		LEFT JOIN vcs v ON w.vcs_id = v.id
 		LEFT JOIN agent a ON w.agent_id = a.id
-		WHERE j.status IN ('pending', 'queue')
+		WHERE (j.status = 'pending')
+		   OR (j.status = 'queue' AND w.locked IS NOT TRUE)
 		ORDER BY j.id ASC
 		LIMIT 10
 	`)
