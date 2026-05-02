@@ -178,7 +178,7 @@ func NewServer(config Config) (*Server, error) {
 	mux.HandleFunc("/actuator/health/readiness", healthHandler)
 	mux.HandleFunc("/actuator/health/liveness", healthHandler)
 
-	// Apply middleware chain: CORS → Auth → Router
+	// Apply middleware chain: CORS → Auth → AuthZ → Router
 	authConfig := middleware.AuthConfig{
 		DexIssuerURI:   config.DexIssuerURI,
 		PatSecret:      config.PatSecret,
@@ -188,6 +188,7 @@ func NewServer(config Config) (*Server, error) {
 	}
 
 	var finalHandler http.Handler = mux
+	finalHandler = middleware.AuthzMiddleware(db.Pool, config.OwnerGroup)(finalHandler)
 	finalHandler = middleware.AuthMiddleware(authConfig)(finalHandler)
 	finalHandler = middleware.CORSMiddleware(config.UIURL)(finalHandler)
 
