@@ -307,11 +307,26 @@ func (h *JSONAPIHandler) handleRelated(w http.ResponseWriter, r *http.Request, p
 			}
 		}
 
+		// Set audit fields
+		setAuditCreate(data, r, childMeta)
+
 		id, err := h.repo.Create(r.Context(), childRel.TargetType, data)
 		if err != nil {
 			log.Printf("Error creating %s under %s/%v: %v", childRel.TargetType, parentType, parentID, err)
 			writeError(w, http.StatusInternalServerError, "Failed to create resource")
 			return
+		}
+
+		// Post-create lifecycle hook: initialise TCL steps for new jobs
+		if childRel.TargetType == "job" && h.tclProcessor != nil {
+			jobID, _ := strconv.Atoi(fmt.Sprintf("%v", id))
+			if jobID > 0 {
+				go func() {
+					if err := h.tclProcessor.InitJobSteps(r.Context(), jobID); err != nil {
+						log.Printf("TCL step init failed for nested job %d: %v", jobID, err)
+					}
+				}()
+			}
 		}
 
 		row, err := h.repo.FindByID(r.Context(), childRel.TargetType, id)
