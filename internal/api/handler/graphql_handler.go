@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
+	"github.com/terrakube-community/terrakubed/internal/api/middleware"
 	"github.com/terrakube-community/terrakubed/internal/api/repository"
 )
 
@@ -70,7 +72,7 @@ func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("GraphQL query: %s", truncate(req.Query, 500))
 
-	result, err := h.executeQuery(r.Context(), req.Query, req.Variables)
+	result, err := h.executeQuery(r, req.Query, req.Variables)
 	if err != nil {
 		log.Printf("GraphQL error: %v", err)
 		writeGQLError(w, err.Error())
@@ -85,12 +87,13 @@ func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // executeQuery parses an Elide-style GraphQL query and executes it.
-func (h *GraphQLHandler) executeQuery(ctx context.Context, query string, variables map[string]interface{}) (interface{}, error) {
+func (h *GraphQLHandler) executeQuery(r *http.Request, query string, variables map[string]interface{}) (interface{}, error) {
+	ctx := r.Context()
 	query = strings.TrimSpace(query)
 
 	// Determine if it's a query or mutation
 	if strings.HasPrefix(query, "mutation") {
-		return h.executeMutation(ctx, query, variables)
+		return h.executeMutation(r, query, variables)
 	}
 
 	// Parse the root resource type from the query
@@ -129,9 +132,9 @@ func (h *GraphQLHandler) fetchByIDs(ctx context.Context, resourceType string, me
 		}
 		node := filterFields(row, fields)
 
-		// Resolve relationships
+		// Resolve relationships, passing the full row for FK access on parent rels
 		for _, rel := range relationships {
-			relData, err := h.resolveRelationship(ctx, id, meta, rel)
+			relData, err := h.resolveRelationship(ctx, id, row, meta, rel)
 			if err != nil {
 				log.Printf("GraphQL: error resolving rel %s for %s/%s: %v", rel.name, resourceType, id, err)
 			} else {
@@ -159,10 +162,10 @@ func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta
 	for _, row := range rows {
 		node := filterFields(row, fields)
 
-		// Resolve relationships
+		// Resolve relationships, passing the full row for FK access on parent rels
 		id := fmt.Sprintf("%v", row[meta.PKColumn])
 		for _, rel := range relationships {
-			relData, err := h.resolveRelationship(ctx, id, meta, rel)
+			relData, err := h.resolveRelationship(ctx, id, row, meta, rel)
 			if err != nil {
 				log.Printf("GraphQL: error resolving rel %s for %s/%s: %v", rel.name, resourceType, id, err)
 			} else {
@@ -180,8 +183,37 @@ func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta
 	}, nil
 }
 
-func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID string, parentMeta *repository.ResourceMeta, rel relInfo) (interface{}, error) {
-	// Check if this is a child relationship
+// resolveRelationship resolves a single relationship for a parent resource node.
+// parentRow is the full DB row for the parent (used to read FK values for to-one rels).
+func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID string, parentRow map[string]interface{}, parentMeta *repository.ResourceMeta, rel relInfo) (interface{}, error) {
+	// ── To-one (parent) relationship ──
+	if toOneRel, ok := parentMeta.Parents[rel.name]; ok {
+		fkVal := parentRow[toOneRel.FKColumn]
+		if fkVal == nil {
+			return map[string]interface{}{"edges": wrapEdges([]map[string]interface{}{})}, nil
+		}
+		relMeta, ok := h.repo.GetMeta(toOneRel.ParentType)
+		if !ok {
+			return nil, fmt.Errorf("unknown type: %s", toOneRel.ParentType)
+		}
+		relRow, err := h.repo.FindByID(ctx, toOneRel.ParentType, fkVal)
+		if err != nil || relRow == nil {
+			return map[string]interface{}{"edges": wrapEdges([]map[string]interface{}{})}, nil
+		}
+		node := filterFields(relRow, rel.fields)
+		relID := fmt.Sprintf("%v", relRow[relMeta.PKColumn])
+		for _, subRel := range rel.rels {
+			subData, err := h.resolveRelationship(ctx, relID, relRow, relMeta, subRel)
+			if err == nil {
+				node[subRel.name] = subData
+			}
+		}
+		return map[string]interface{}{
+			"edges": wrapEdges([]map[string]interface{}{node}),
+		}, nil
+	}
+
+	// ── To-many (child) relationship ──
 	childRel, ok := parentMeta.Children[rel.name]
 	if !ok {
 		return nil, fmt.Errorf("unknown relationship: %s", rel.name)
@@ -227,7 +259,7 @@ func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID strin
 		if childMeta != nil {
 			childID := fmt.Sprintf("%v", row[childMeta.PKColumn])
 			for _, subRel := range rel.rels {
-				subData, err := h.resolveRelationship(ctx, childID, childMeta, subRel)
+				subData, err := h.resolveRelationship(ctx, childID, row, childMeta, subRel)
 				if err == nil {
 					node[subRel.name] = subData
 				}
@@ -243,7 +275,8 @@ func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID strin
 }
 
 // executeMutation handles create/update/delete mutations.
-func (h *GraphQLHandler) executeMutation(ctx context.Context, query string, variables map[string]interface{}) (interface{}, error) {
+func (h *GraphQLHandler) executeMutation(r *http.Request, query string, variables map[string]interface{}) (interface{}, error) {
+	ctx := r.Context()
 	// Elide mutations look like:
 	// mutation { organization(op: UPSERT, data: {id: "...", name: "..."}) { edges { node { id name } } } }
 	// mutation { organization(op: DELETE, ids: ["..."]) { edges { node { id } } } }
@@ -259,11 +292,14 @@ func (h *GraphQLHandler) executeMutation(ctx context.Context, query string, vari
 		return nil, fmt.Errorf("unknown resource type: %s", rootType)
 	}
 
+	meta, _ := h.repo.GetMeta(rootType)
+
 	switch strings.ToUpper(op) {
 	case "UPSERT":
 		id, _ := data["id"].(string)
 		if id != "" {
-			// Update
+			// Update — set updated_by / updated_date
+			setGQLAuditUpdate(ctx, data, meta)
 			if err := h.repo.Update(ctx, rootType, id, data); err != nil {
 				return nil, err
 			}
@@ -277,7 +313,8 @@ func (h *GraphQLHandler) executeMutation(ctx context.Context, query string, vari
 				},
 			}, nil
 		}
-		// Create
+		// Create — set created_by / updated_by / created_date / updated_date
+		setGQLAuditCreate(ctx, data, meta)
 		newID, err := h.repo.Create(ctx, rootType, data)
 		if err != nil {
 			return nil, err
@@ -664,4 +701,41 @@ func truncate(s string, maxLen int) string {
 		return s[:maxLen] + "..."
 	}
 	return s
+}
+
+// setGQLAuditCreate sets audit columns for GraphQL UPSERT (create path).
+func setGQLAuditCreate(ctx context.Context, data map[string]interface{}, meta *repository.ResourceMeta) {
+	now := time.Now()
+	email := gqlUserEmail(ctx)
+	setIfColExists(data, meta, "created_by", email)
+	setIfColExists(data, meta, "updated_by", email)
+	setIfColExists(data, meta, "created_date", now)
+	setIfColExists(data, meta, "updated_date", now)
+}
+
+// setGQLAuditUpdate sets audit columns for GraphQL UPSERT (update path).
+func setGQLAuditUpdate(ctx context.Context, data map[string]interface{}, meta *repository.ResourceMeta) {
+	now := time.Now()
+	email := gqlUserEmail(ctx)
+	setIfColExists(data, meta, "updated_by", email)
+	setIfColExists(data, meta, "updated_date", now)
+}
+
+func setIfColExists(data map[string]interface{}, meta *repository.ResourceMeta, col string, val interface{}) {
+	if meta == nil {
+		return
+	}
+	for _, c := range meta.Columns {
+		if c == col {
+			data[col] = val
+			return
+		}
+	}
+}
+
+func gqlUserEmail(ctx context.Context) string {
+	if user := middleware.GetUser(ctx); user != nil {
+		return user.Email
+	}
+	return ""
 }
