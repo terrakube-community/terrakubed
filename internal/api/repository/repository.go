@@ -236,12 +236,17 @@ func (r *GenericRepository) List(ctx context.Context, resourceType string, param
 		sb.WriteString(strings.Join(conditions, " AND "))
 	}
 
-	// Sorting
+	// Sorting — convert camelCase (from GraphQL/JSON:API) to snake_case (DB column)
 	if params.Sort != "" {
-		if strings.HasPrefix(params.Sort, "-") {
-			sb.WriteString(fmt.Sprintf(" ORDER BY %s DESC", strings.TrimPrefix(params.Sort, "-")))
-		} else {
-			sb.WriteString(fmt.Sprintf(" ORDER BY %s ASC", params.Sort))
+		desc := strings.HasPrefix(params.Sort, "-")
+		col := camelToSnakeRepo(strings.TrimPrefix(params.Sort, "-"))
+		// Validate: only allow word characters to prevent SQL injection
+		if isSafeColumnName(col) {
+			if desc {
+				sb.WriteString(fmt.Sprintf(" ORDER BY %s DESC", col))
+			} else {
+				sb.WriteString(fmt.Sprintf(" ORDER BY %s ASC", col))
+			}
 		}
 	}
 
@@ -445,6 +450,37 @@ func scanRows(rows pgx.Rows, columns []string) ([]map[string]interface{}, error)
 	}
 
 	return results, nil
+}
+
+// camelToSnakeRepo converts camelCase to snake_case: "terraformVersion" → "terraform_version".
+// Used for sort/filter column name conversion.
+func camelToSnakeRepo(s string) string {
+	var b strings.Builder
+	for i, r := range s {
+		if r >= 'A' && r <= 'Z' {
+			if i > 0 {
+				b.WriteByte('_')
+			}
+			b.WriteRune(r + 32)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// isSafeColumnName returns true if s consists only of word characters (a-z, 0-9, _).
+// This guards against SQL injection in ORDER BY clauses.
+func isSafeColumnName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 // maskSensitive blanks SensitiveMaskColumns in a row when the SensitiveFlagColumn is true.
