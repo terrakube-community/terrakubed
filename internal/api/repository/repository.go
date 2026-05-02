@@ -37,6 +37,10 @@ type ResourceMeta struct {
 	SoftDeleteColumn string
 	// Default values for columns when not provided during creation
 	DefaultValues map[string]interface{}
+	// Sensitive masking: when SensitiveFlagColumn is true, SensitiveMaskColumns are blanked in responses.
+	// Used for variable.value and globalvar.value when sensitive = true.
+	SensitiveFlagColumn  string
+	SensitiveMaskColumns []string
 }
 
 // ParentRelation describes a ManyToOne/OneToOne FK relationship.
@@ -232,12 +236,17 @@ func (r *GenericRepository) List(ctx context.Context, resourceType string, param
 		sb.WriteString(strings.Join(conditions, " AND "))
 	}
 
-	// Sorting
+	// Sorting — convert camelCase (from GraphQL/JSON:API) to snake_case (DB column)
 	if params.Sort != "" {
-		if strings.HasPrefix(params.Sort, "-") {
-			sb.WriteString(fmt.Sprintf(" ORDER BY %s DESC", strings.TrimPrefix(params.Sort, "-")))
-		} else {
-			sb.WriteString(fmt.Sprintf(" ORDER BY %s ASC", params.Sort))
+		desc := strings.HasPrefix(params.Sort, "-")
+		col := camelToSnakeRepo(strings.TrimPrefix(params.Sort, "-"))
+		// Validate: only allow word characters to prevent SQL injection
+		if isSafeColumnName(col) {
+			if desc {
+				sb.WriteString(fmt.Sprintf(" ORDER BY %s DESC", col))
+			} else {
+				sb.WriteString(fmt.Sprintf(" ORDER BY %s ASC", col))
+			}
 		}
 	}
 
@@ -255,10 +264,59 @@ func (r *GenericRepository) List(ctx context.Context, resourceType string, param
 	}
 	defer rows.Close()
 
-	return scanRows(rows, selectCols)
+	results, err := scanRows(rows, selectCols)
+	if err != nil {
+		return nil, err
+	}
+	if meta.SensitiveFlagColumn != "" {
+		for _, row := range results {
+			maskSensitive(row, meta.SensitiveFlagColumn, meta.SensitiveMaskColumns)
+		}
+	}
+	return results, nil
 }
 
 // FindByID returns a single row by primary key.
+// Count returns the total number of rows matching the given params (without pagination).
+// Used to populate JSON:API meta.page.totalRecords.
+func (r *GenericRepository) Count(ctx context.Context, resourceType string, params ListParams) (int, error) {
+	meta, ok := r.resources[resourceType]
+	if !ok {
+		return 0, fmt.Errorf("unknown resource type: %s", resourceType)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("SELECT COUNT(*) FROM ")
+	sb.WriteString(meta.Table)
+
+	var args []interface{}
+	argIdx := 1
+	var conditions []string
+
+	if meta.SoftDeleteColumn != "" {
+		conditions = append(conditions, fmt.Sprintf("%s IS NOT TRUE", meta.SoftDeleteColumn))
+	}
+	if params.ParentFK != "" && params.ParentID != nil {
+		conditions = append(conditions, fmt.Sprintf("%s = $%d", params.ParentFK, argIdx))
+		args = append(args, params.ParentID)
+		argIdx++
+	}
+	for col, val := range params.Filters {
+		conditions = append(conditions, fmt.Sprintf("%s = $%d", col, argIdx))
+		args = append(args, val)
+		argIdx++
+	}
+	_ = argIdx
+	if len(conditions) > 0 {
+		sb.WriteString(" WHERE ")
+		sb.WriteString(strings.Join(conditions, " AND "))
+	}
+
+	var count int
+	err := r.pool.QueryRow(ctx, sb.String(), args...).Scan(&count)
+	return count, err
+}
+
 func (r *GenericRepository) FindByID(ctx context.Context, resourceType string, id interface{}) (map[string]interface{}, error) {
 	meta, ok := r.resources[resourceType]
 	if !ok {
@@ -289,7 +347,11 @@ func (r *GenericRepository) FindByID(ctx context.Context, resourceType string, i
 	if len(results) == 0 {
 		return nil, nil // Not found
 	}
-	return results[0], nil
+	row := results[0]
+	if meta.SensitiveFlagColumn != "" {
+		maskSensitive(row, meta.SensitiveFlagColumn, meta.SensitiveMaskColumns)
+	}
+	return row, nil
 }
 
 // Create inserts a new row and returns the generated ID.
@@ -428,4 +490,55 @@ func scanRows(rows pgx.Rows, columns []string) ([]map[string]interface{}, error)
 	}
 
 	return results, nil
+}
+
+// camelToSnakeRepo converts camelCase to snake_case: "terraformVersion" → "terraform_version".
+// Used for sort/filter column name conversion.
+func camelToSnakeRepo(s string) string {
+	var b strings.Builder
+	for i, r := range s {
+		if r >= 'A' && r <= 'Z' {
+			if i > 0 {
+				b.WriteByte('_')
+			}
+			b.WriteRune(r + 32)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// isSafeColumnName returns true if s consists only of word characters (a-z, 0-9, _).
+// This guards against SQL injection in ORDER BY clauses.
+func isSafeColumnName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// maskSensitive blanks SensitiveMaskColumns in a row when the SensitiveFlagColumn is true.
+// This prevents secret variable values from being returned in API responses.
+func maskSensitive(row map[string]interface{}, flagCol string, maskCols []string) {
+	if len(maskCols) == 0 {
+		return
+	}
+	isSensitive := false
+	switch v := row[flagCol].(type) {
+	case bool:
+		isSensitive = v
+	case *bool:
+		isSensitive = v != nil && *v
+	}
+	if isSensitive {
+		for _, col := range maskCols {
+			row[col] = ""
+		}
+	}
 }

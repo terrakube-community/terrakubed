@@ -10,14 +10,18 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/terrakube-community/terrakubed/internal/api/jsonapi"
 	"github.com/terrakube-community/terrakubed/internal/api/repository"
+	"github.com/terrakube-community/terrakubed/internal/api/tcl"
 )
 
 // JSONAPIHandler handles generic JSON:API requests for all resource types.
 type JSONAPIHandler struct {
-	repo    *repository.GenericRepository
-	configs map[string]*jsonapi.ResourceConfig
+	repo         *repository.GenericRepository
+	configs      map[string]*jsonapi.ResourceConfig
+	tclProcessor *tcl.Processor
+	pool         *pgxpool.Pool
 }
 
 // NewJSONAPIHandler creates a new handler.
@@ -27,6 +31,13 @@ func NewJSONAPIHandler(repo *repository.GenericRepository) *JSONAPIHandler {
 		configs: make(map[string]*jsonapi.ResourceConfig),
 	}
 	h.buildConfigs()
+	return h
+}
+
+// WithPool wires the DB pool for lifecycle hooks (TCL step init, workspace unlock, etc.).
+func (h *JSONAPIHandler) WithPool(pool *pgxpool.Pool) *JSONAPIHandler {
+	h.pool = pool
+	h.tclProcessor = tcl.NewProcessor(pool)
 	return h
 }
 
@@ -115,17 +126,27 @@ func (h *JSONAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// /api/v1/{type}/{id} — Get, Update, or Delete
 		h.handleResource(w, r, segments[0], segments[1])
 	case len(segments) == 3:
-		// /api/v1/{type}/{id}/{relationship} — List related
+		// /api/v1/{type}/{id}/{relationship} — List related or create child
 		h.handleRelated(w, r, segments[0], segments[1], segments[2])
 	case len(segments) == 4 && segments[2] == "relationships":
 		// /api/v1/{type}/{id}/relationships/{rel} — Relationship link
 		h.handleRelationshipLink(w, r, segments[0], segments[1], segments[3])
-	case len(segments) == 4:
-		// /api/v1/{parentType}/{parentId}/{childType}/{childId}
-		// Nested resource access: resolve child by its ID directly
-		h.handleResource(w, r, segments[2], segments[3])
 	default:
-		writeError(w, http.StatusNotFound, "Invalid path")
+		// Deep nesting: /api/v1/{t0}/{id0}/{t1}/{id1}[/{t2}/{id2}...]
+		// Elide-style: find the last type/id pair and operate on it.
+		// If odd number of segments after /api/v1/, last segment is a relationship.
+		if len(segments)%2 == 0 {
+			// Even → last pair is the target resource
+			innerType := segments[len(segments)-2]
+			innerID := segments[len(segments)-1]
+			h.handleResource(w, r, innerType, innerID)
+		} else {
+			// Odd → last segment is a relationship on the penultimate resource
+			parentType := segments[len(segments)-3]
+			parentID := segments[len(segments)-2]
+			relName := segments[len(segments)-1]
+			h.handleRelated(w, r, parentType, parentID, relName)
+		}
 	}
 }
 
@@ -389,6 +410,20 @@ func (h *JSONAPIHandler) listResources(w http.ResponseWriter, r *http.Request, r
 
 	basePath := "/api/v1"
 	doc := jsonapi.SerializeList(config, rows, basePath)
+
+	// Add pagination meta when pagination is active (matching Elide's meta.page format)
+	if params.PageSize > 0 {
+		total, _ := h.repo.Count(r.Context(), resourceType, params)
+		doc.Meta = map[string]interface{}{
+			"page": map[string]interface{}{
+				"totalRecords": total,
+				"number":       params.PageOffset/params.PageSize + 1,
+				"size":         params.PageSize,
+				"totalPages":   (total + params.PageSize - 1) / params.PageSize,
+			},
+		}
+	}
+
 	writeJSON(w, http.StatusOK, doc)
 }
 
@@ -469,6 +504,18 @@ func (h *JSONAPIHandler) createResource(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	// Post-create lifecycle hook: initialise TCL steps for new jobs
+	if resourceType == "job" && h.tclProcessor != nil {
+		jobID, _ := strconv.Atoi(fmt.Sprintf("%v", id))
+		if jobID > 0 {
+			go func() {
+				if err := h.tclProcessor.InitJobSteps(r.Context(), jobID); err != nil {
+					log.Printf("TCL step init failed for job %d: %v", jobID, err)
+				}
+			}()
+		}
+	}
+
 	// Reload and return
 	row, err := h.repo.FindByID(r.Context(), resourceType, id)
 	if err != nil || row == nil {
@@ -501,6 +548,44 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 		log.Printf("Error updating %s/%v: %v", resourceType, id, err)
 		writeError(w, http.StatusInternalServerError, "Failed to update resource")
 		return
+	}
+
+	// Post-update lifecycle hooks
+	if resourceType == "job" && h.pool != nil {
+		if newStatus, ok := data["status"].(string); ok {
+			switch newStatus {
+			case "completed", "failed", "noChanges", "rejected":
+				// Unlock the workspace when a job reaches any terminal state.
+				// The executor K8s pod updates job status directly via API; the scheduler
+				// doesn't see terminal-state jobs in its poll loop so workspace unlock
+				// must happen here instead.
+				// Also update workspace.last_job_status / last_job_date for the UI.
+				go func(jobID interface{}, status string) {
+					ctx := r.Context()
+					_, err := h.pool.Exec(ctx,
+						`UPDATE workspace SET
+						   locked = false,
+						   last_job_status = $2,
+						   last_job_date = NOW()
+						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`,
+						jobID, status)
+					if err != nil {
+						log.Printf("Failed to unlock/update workspace for job %v: %v", jobID, err)
+					} else {
+						log.Printf("Job %v terminal state %q — workspace unlocked, last_job_status updated", jobID, status)
+					}
+				}(id, newStatus)
+			case "running":
+				// Update last_job_status to "running" so the UI shows the workspace as active
+				go func(jobID interface{}) {
+					ctx := r.Context()
+					_, _ = h.pool.Exec(ctx,
+						`UPDATE workspace SET last_job_status = 'running'
+						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`,
+						jobID)
+				}(id)
+			}
+		}
 	}
 
 	// Reload and return

@@ -212,6 +212,7 @@ func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID strin
 		ParentFK: childRel.FKColumn,
 		ParentID: parentID,
 		Columns:  selectCols,
+		Sort:     rel.sort,
 	}
 	rows, err := h.repo.List(ctx, childRel.ChildType, params)
 	if err != nil {
@@ -312,6 +313,7 @@ func (h *GraphQLHandler) executeMutation(ctx context.Context, query string, vari
 
 type relInfo struct {
 	name   string
+	sort   string    // e.g. "name" or "-name" (from sort: "name" arg)
 	fields []string
 	rels   []relInfo // nested relationships
 }
@@ -388,6 +390,34 @@ func findNodeBody(s string) string {
 	}
 }
 
+// extractParenContent extracts content between matching parens starting at position of '('.
+func extractParenContent(s string, openPos int) string {
+	depth := 0
+	for i := openPos; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return s[openPos+1 : i]
+			}
+		}
+	}
+	return ""
+}
+
+// parseSortArg extracts the value of a sort: "..." argument.
+// Returns empty string if not present.
+func parseSortArg(args string) string {
+	sortRe := regexp.MustCompile(`sort\s*:\s*"([^"]+)"`)
+	m := sortRe.FindStringSubmatch(args)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
 // extractBraceContent extracts content between matching braces starting at position of '{'.
 func extractBraceContent(s string, openPos int) string {
 	depth := 0
@@ -436,8 +466,14 @@ func parseNodeBody(body string) (fields []string, rels []relInfo) {
 			i++
 		}
 
-		// Skip optional arguments: (sort: "name", filter: ...)
+		// Parse optional arguments: (sort: "name", filter: ...)
+		// We capture sort so child relationships can be ordered correctly.
+		var relSort string
 		if i < len(body) && body[i] == '(' {
+			// Extract the args content
+			argsContent := extractParenContent(body, i)
+			relSort = parseSortArg(argsContent)
+			// Advance past the closing paren
 			depth := 0
 			for i < len(body) {
 				if body[i] == '(' {
@@ -481,7 +517,7 @@ func parseNodeBody(body string) (fields []string, rels []relInfo) {
 			relNodeBody := findNodeBody(content)
 			if relNodeBody != "" {
 				relFields, subRels := parseNodeBody(relNodeBody)
-				rels = append(rels, relInfo{name: word, fields: relFields, rels: subRels})
+				rels = append(rels, relInfo{name: word, sort: relSort, fields: relFields, rels: subRels})
 			}
 		} else {
 			// It's a scalar field

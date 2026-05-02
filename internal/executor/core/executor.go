@@ -364,17 +364,18 @@ func (p *JobProcessor) executeTerraform(job *model.TerraformJob, workingDir stri
 			log.Printf("Failed to set pending status: %v", err)
 		}
 		p.notifySlackPlanPending(job, parsePlanSummary(output))
+	} else if isPlan {
+		// Plan exit 0 → no infrastructure changes
+		if err := p.Status.SetNoChanges(job, output); err != nil {
+			log.Printf("Failed to set noChanges status: %v", err)
+		}
+		p.notifySlackPlanNoChanges(job)
 	} else {
+		// Apply or Destroy succeeded
 		if err := p.Status.SetCompleted(job, true, output); err != nil {
 			log.Printf("Failed to set completed status: %v", err)
 		}
-		if isPlan {
-			// Plan exit 0 → no changes
-			p.notifySlackPlanNoChanges(job)
-		} else {
-			// Apply or Destroy succeeded
-			p.notifySlackSuccess(job)
-		}
+		p.notifySlackSuccess(job)
 	}
 
 	return nil

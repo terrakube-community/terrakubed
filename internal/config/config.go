@@ -50,6 +50,12 @@ type Config struct {
 	OwnerGroup    string
 	RedisAddress  string
 	RedisPassword string
+
+	// API → Kubernetes executor config
+	ExecutorNamespace      string
+	ExecutorImage          string
+	ExecutorSecretName     string
+	ExecutorServiceAccount string
 }
 
 func getEnvWithFallback(primary, fallback string) string {
@@ -216,6 +222,12 @@ func LoadConfig() (*Config, error) {
 		OwnerGroup:    getEnvWithFallback("TERRAKUBE_OWNER", "TerrakubeOwner"),
 		RedisAddress:  buildRedisAddress(),
 		RedisPassword: getEnvChain("TerrakubeRedisPassword", "REDIS_PASSWORD"),
+
+		// Kubernetes executor
+		ExecutorNamespace:      getEnvChain("EXECUTOR_NAMESPACE", "TerrakubeExecutorNamespace"),
+		ExecutorImage:          getEnvChain("EXECUTOR_IMAGE", "TerrakubeExecutorImage", "AzBuilderRegistry"),
+		ExecutorSecretName:     getEnvChain("EXECUTOR_SECRET_NAME", "TerrakubeExecutorSecret"),
+		ExecutorServiceAccount: getEnvChain("EXECUTOR_SERVICE_ACCOUNT", "TerrakubeExecutorServiceAccount"),
 	}
 
 	// Override API / Secret if provided by executor envs

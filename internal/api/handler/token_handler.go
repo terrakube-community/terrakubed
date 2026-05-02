@@ -12,6 +12,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/terrakube-community/terrakubed/internal/api/middleware"
 )
 
 // PatHandler handles /pat/v1 endpoints for Personal Access Token management.
@@ -64,16 +65,23 @@ func (h *PatHandler) createToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get user info from context (set by auth middleware)
-	email := r.Header.Get("X-User-Email")
-	name := r.Header.Get("X-User-Name")
-	groups := r.Header.Get("X-User-Groups")
-	if email == "" {
-		email = "unknown"
+	// Get user info from context (set by AuthMiddleware)
+	user := middleware.GetUser(r.Context())
+	email := "unknown"
+	name := "unknown"
+	groups := ""
+	if user != nil {
+		if user.Email != "" {
+			email = user.Email
+		}
+		if user.Name != "" {
+			name = user.Name
+		}
+		if len(user.Groups) > 0 {
+			groups = strings.Join(user.Groups, ",")
+		}
 	}
-	if name == "" {
-		name = email
-	}
+	_ = groups
 
 	// Insert PAT record
 	patID := uuid.New()
@@ -125,7 +133,10 @@ func (h *PatHandler) createToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *PatHandler) listTokens(w http.ResponseWriter, r *http.Request) {
-	email := r.Header.Get("X-User-Email")
+	email := "unknown"
+	if user := middleware.GetUser(r.Context()); user != nil && user.Email != "" {
+		email = user.Email
+	}
 
 	rows, err := h.pool.Query(r.Context(),
 		`SELECT id, description, days, created_date, created_by
@@ -223,11 +234,10 @@ func (h *TeamTokenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *TeamTokenHandler) currentTeams(w http.ResponseWriter, r *http.Request) {
-	// Get user's groups from auth header (set by middleware)
-	groupsStr := r.Header.Get("X-User-Groups")
+	// Get user's groups from context (set by AuthMiddleware)
 	groups := make([]string, 0)
-	if groupsStr != "" {
-		for _, g := range strings.Split(groupsStr, ",") {
+	if user := middleware.GetUser(r.Context()); user != nil {
+		for _, g := range user.Groups {
 			g = strings.TrimSpace(g)
 			if g != "" {
 				groups = append(groups, g)
@@ -245,15 +255,20 @@ func (h *TeamTokenHandler) getPermissions(w http.ResponseWriter, r *http.Request
 	parts := strings.Split(strings.TrimPrefix(path, "/permissions/organization/"), "/")
 	orgID := parts[0]
 
-	groupsStr := r.Header.Get("X-User-Groups")
-	groups := strings.Split(groupsStr, ",")
-
-	// Check if user is owner
+	// Get user's groups from context (set by AuthMiddleware)
+	groups := make([]string, 0)
 	isOwner := false
-	for _, g := range groups {
-		if strings.TrimSpace(g) == h.ownerGroup {
+	if user := middleware.GetUser(r.Context()); user != nil {
+		// Service accounts get full permissions
+		if user.IsServiceAccount() {
 			isOwner = true
-			break
+		} else {
+			for _, g := range user.Groups {
+				groups = append(groups, strings.TrimSpace(g))
+				if strings.TrimSpace(g) == h.ownerGroup {
+					isOwner = true
+				}
+			}
 		}
 	}
 
@@ -326,8 +341,15 @@ func (h *TeamTokenHandler) loadTeamPermissions(ctx context.Context, orgID string
 }
 
 func (h *TeamTokenHandler) loadWorkspacePermissions(ctx context.Context, wsID string, groups []string, permissions map[string]bool) {
+	if len(groups) == 0 {
+		return
+	}
+	// Filter by user's groups: access.name contains the team/group name
 	rows, err := h.pool.Query(ctx,
-		`SELECT manage_state, manage_workspace, manage_job FROM access WHERE workspace_id = $1`, wsID)
+		`SELECT manage_state, manage_workspace, manage_job
+		 FROM access
+		 WHERE workspace_id = $1 AND name = ANY($2::text[])`,
+		wsID, groups)
 	if err != nil {
 		return
 	}
@@ -359,10 +381,15 @@ func (h *TeamTokenHandler) createToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	email := r.Header.Get("X-User-Email")
-	name := r.Header.Get("X-User-Name")
-	if name == "" {
-		name = email
+	email := "unknown"
+	name := "unknown"
+	if user := middleware.GetUser(r.Context()); user != nil {
+		if user.Email != "" {
+			email = user.Email
+		}
+		if user.Name != "" {
+			name = user.Name
+		}
 	}
 
 	duration := time.Duration(req.Days)*24*time.Hour +
@@ -400,7 +427,10 @@ func (h *TeamTokenHandler) createToken(w http.ResponseWriter, r *http.Request) {
 
 func (h *TeamTokenHandler) listTokens(w http.ResponseWriter, r *http.Request) {
 	// Group table stores team tokens in Java API
-	email := r.Header.Get("X-User-Email")
+	email := "unknown"
+	if user := middleware.GetUser(r.Context()); user != nil && user.Email != "" {
+		email = user.Email
+	}
 
 	rows, err := h.pool.Query(r.Context(),
 		`SELECT id, description, days, created_date, created_by

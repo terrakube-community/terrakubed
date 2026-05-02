@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/terrakube-community/terrakubed/internal/api/repository"
 	"github.com/terrakube-community/terrakubed/internal/api/streaming"
 	"github.com/terrakube-community/terrakubed/internal/storage"
@@ -16,8 +17,8 @@ import (
 
 // LogsHandler handles the /logs endpoint for Redis log streaming.
 type LogsHandler struct {
-	repo *repository.GenericRepository
-	// redisClient will be injected later
+	repo  *repository.GenericRepository
+	redis *redis.Client // optional; live streaming disabled when nil
 }
 
 // NewLogsHandler creates a new LogsHandler.
@@ -25,18 +26,38 @@ func NewLogsHandler(repo *repository.GenericRepository) *LogsHandler {
 	return &LogsHandler{repo: repo}
 }
 
+// WithRedis wires an optional Redis client for live log streaming.
+func (h *LogsHandler) WithRedis(client *redis.Client) *LogsHandler {
+	h.redis = client
+	return h
+}
+
 // SetupConsumerGroups handles POST /logs/{jobId}/setup-consumer-groups
+// Creates the Redis consumer groups that the Java streaming service expects.
 func (h *LogsHandler) SetupConsumerGroups(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// TODO: Create Redis consumer groups for the job
-	log.Printf("Setup consumer groups called")
+
+	// Extract jobId from path
+	path := strings.TrimPrefix(r.URL.Path, "/logs/")
+	jobID := strings.TrimSuffix(path, "/setup-consumer-groups")
+
+	if h.redis != nil && jobID != "" {
+		streamKey := streaming.JDKSerialize(jobID)
+		ctx := r.Context()
+		_ = h.redis.XGroupCreateMkStream(ctx, streamKey, "CLI", "0").Err()
+		_ = h.redis.XGroupCreateMkStream(ctx, streamKey, "UI", "0").Err()
+		log.Printf("LogsHandler: created consumer groups for job %s", jobID)
+	}
+
 	w.WriteHeader(http.StatusOK)
 }
 
-// AppendLogs handles POST /logs
+// AppendLogs handles POST /logs — receives log lines from executors and writes to Redis.
+// The Java executor posts here; the Go executor writes directly to Redis.
+// Path: POST /logs (body: JSON with data array)
 func (h *LogsHandler) AppendLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -63,8 +84,24 @@ func (h *LogsHandler) AppendLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: Write to Redis stream
-	log.Printf("Append logs: %d entries", len(req.Data))
+	if h.redis != nil {
+		ctx := r.Context()
+		for _, entry := range req.Data {
+			jobID := fmt.Sprintf("%v", entry.JobID)
+			streamKey := streaming.JDKSerialize(jobID)
+			_ = h.redis.XAdd(ctx, &redis.XAddArgs{
+				Stream: streamKey,
+				Values: map[string]interface{}{
+					streaming.JDKSerialize("jobId"):      streaming.JDKSerialize(jobID),
+					streaming.JDKSerialize("stepId"):     streaming.JDKSerialize(entry.StepID),
+					streaming.JDKSerialize("lineNumber"): streaming.JDKSerialize(entry.LineNumber),
+					streaming.JDKSerialize("output"):     streaming.JDKSerialize(entry.Output),
+				},
+			}).Err()
+		}
+	}
+
+	log.Printf("AppendLogs: %d entries (redis=%v)", len(req.Data), h.redis != nil)
 	w.WriteHeader(http.StatusOK)
 }
 

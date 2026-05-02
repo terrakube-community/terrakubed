@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -13,7 +14,10 @@ import (
 	"github.com/terrakube-community/terrakubed/internal/api/middleware"
 	"github.com/terrakube-community/terrakubed/internal/api/registry"
 	"github.com/terrakube-community/terrakubed/internal/api/repository"
+	"github.com/terrakube-community/terrakubed/internal/api/scheduler"
 	"github.com/terrakube-community/terrakubed/internal/api/streaming"
+	"github.com/terrakube-community/terrakubed/internal/api/tcl"
+	"github.com/terrakube-community/terrakubed/internal/api/vcs"
 	"github.com/terrakube-community/terrakubed/internal/storage"
 )
 
@@ -30,14 +34,23 @@ type Config struct {
 	StorageType    string
 	RedisAddress   string
 	RedisPassword  string
+
+	// Kubernetes executor config
+	ExecutorNamespace      string
+	ExecutorImage          string
+	ExecutorSecretName     string
+	ExecutorServiceAccount string
 }
 
 // Server is the main API server.
 type Server struct {
-	config  Config
-	db      *database.Pool
-	repo    *repository.GenericRepository
-	handler http.Handler
+	config           Config
+	db               *database.Pool
+	repo             *repository.GenericRepository
+	handler          http.Handler
+	scheduler        *scheduler.JobScheduler
+	schedulePoller   *scheduler.SchedulePoller
+	tokenRefresher   *vcs.TokenRefresher
 }
 
 // NewServer creates a new API server.
@@ -57,10 +70,10 @@ func NewServer(config Config) (*Server, error) {
 	// Validate model columns against actual DB schema
 	repo.ValidateColumns(ctx)
 
-	// Create JSON:API handler
-	jsonapiHandler := handler.NewJSONAPIHandler(repo)
+	// Create JSON:API handler (with TCL lifecycle hook)
+	jsonapiHandler := handler.NewJSONAPIHandler(repo).WithPool(db.Pool)
 
-	// Create custom handlers
+	// Create custom handlers (Redis wired in after Redis client is created)
 	logsHandler := handler.NewLogsHandler(repo)
 
 	// Create storage service
@@ -91,12 +104,20 @@ func NewServer(config Config) (*Server, error) {
 
 	logStreamer := streaming.NewLogStreamReader(redisClient, storageService)
 
+	// Wire Redis into the logs handler (enables live log append from Java executor)
+	if redisClient != nil {
+		logsHandler.WithRedis(redisClient)
+	}
+
 	outputHandler := handler.NewTerraformOutputHandler(repo, logStreamer)
 
 	// State & TFE handlers
 	stateHandler := handler.NewTerraformStateHandler(db.Pool, config.Hostname, storageService)
 	tfeHandler := handler.NewRemoteTFEHandler(db.Pool, config.Hostname, storageService)
 	wellKnownHandler := handler.NewWellKnownHandler(config.Hostname)
+
+	// Module and provider registry
+	registryHandler := handler.NewRegistryHandler(db.Pool, config.Hostname, storageService)
 
 	// Set up routes
 	mux := http.NewServeMux()
@@ -121,10 +142,30 @@ func NewServer(config Config) (*Server, error) {
 	mux.Handle("/access-token/v1/teams", teamTokenHandler)
 	mux.Handle("/access-token/v1/teams/", teamTokenHandler)
 
+	// VCS webhook endpoints (GitHub, GitLab, Bitbucket)
+	webhookHandler := handler.NewWebhookHandler(db.Pool)
+	mux.Handle("/webhook/v1/", webhookHandler)
+
+	// VCS OAuth callback (GitHub, GitLab, Bitbucket token exchange)
+	vcsCallbackHandler := handler.NewVCSCallbackHandler(db.Pool, config.Hostname, config.UIURL)
+	mux.Handle("/callback/v1/", vcsCallbackHandler)
+
+	// Approval endpoints (approve/reject plan before apply)
+	approvalHandler := handler.NewApprovalHandler(db.Pool)
+	mux.Handle("/approval/v1/", approvalHandler)
+
+	// /app/{orgId}/{wsId}/runs/{jobId} → redirect to UI run page
+	// Used by Slack notifications when TERRAKUBE_UI_URL isn't set on the executor
+	appRedirectHandler := handler.NewAppRedirectHandler(config.UIURL)
+	mux.Handle("/app/", appRedirectHandler)
+
 	// State & TFE endpoints
 	mux.Handle("/tfstate/v1/", stateHandler)
 	mux.Handle("/remote/tfe/v2/", tfeHandler)
 	mux.Handle("/.well-known/terraform.json", wellKnownHandler)
+
+	// Module and provider registry
+	mux.Handle("/registry/v1/", registryHandler)
 
 	// Health check — compatible with Spring Boot actuator probes
 	healthHandler := func(w http.ResponseWriter, r *http.Request) {
@@ -137,7 +178,7 @@ func NewServer(config Config) (*Server, error) {
 	mux.HandleFunc("/actuator/health/readiness", healthHandler)
 	mux.HandleFunc("/actuator/health/liveness", healthHandler)
 
-	// Apply middleware chain: CORS → Auth → Router
+	// Apply middleware chain: CORS → Auth → AuthZ → Router
 	authConfig := middleware.AuthConfig{
 		DexIssuerURI:   config.DexIssuerURI,
 		PatSecret:      config.PatSecret,
@@ -147,19 +188,62 @@ func NewServer(config Config) (*Server, error) {
 	}
 
 	var finalHandler http.Handler = mux
+	finalHandler = middleware.AuthzMiddleware(db.Pool, config.OwnerGroup)(finalHandler)
 	finalHandler = middleware.AuthMiddleware(authConfig)(finalHandler)
 	finalHandler = middleware.CORSMiddleware(config.UIURL)(finalHandler)
 
+	// Set up job scheduler with Kubernetes executor
+	executor, err := scheduler.NewEphemeralExecutor(scheduler.EphemeralConfig{
+		Namespace:      config.ExecutorNamespace,
+		Image:          config.ExecutorImage,
+		SecretName:     config.ExecutorSecretName,
+		ServiceAccount: config.ExecutorServiceAccount,
+	})
+	if err != nil {
+		log.Printf("Warning: failed to create K8s executor (%v) — job scheduling disabled", err)
+	}
+
+	var jobScheduler *scheduler.JobScheduler
+	if executor != nil {
+		jobScheduler = scheduler.NewJobScheduler(db.Pool, executor, 5*time.Second)
+	}
+
+	// Schedule poller: watches workspace schedules and triggers cron jobs
+	tclProc := tcl.NewProcessor(db.Pool)
+	schedulePoller := scheduler.NewSchedulePoller(db.Pool, tclProc)
+
+	// VCS token refresher: keeps OAuth tokens alive for GitLab/Bitbucket
+	tokenRefresher := vcs.NewTokenRefresher(db.Pool)
+
 	return &Server{
-		config:  config,
-		db:      db,
-		repo:    repo,
-		handler: finalHandler,
+		config:         config,
+		db:             db,
+		repo:           repo,
+		handler:        finalHandler,
+		scheduler:      jobScheduler,
+		schedulePoller: schedulePoller,
+		tokenRefresher: tokenRefresher,
 	}, nil
 }
 
-// Start starts the HTTP server.
+// Start starts the HTTP server and background services.
 func (s *Server) Start() error {
+	ctx := context.Background()
+
+	if s.scheduler != nil {
+		go s.scheduler.Start(ctx)
+		log.Printf("Job scheduler started (poll interval: 5s)")
+	}
+
+	if s.schedulePoller != nil {
+		go s.schedulePoller.Start(ctx)
+		log.Printf("Schedule poller started (sync interval: 60s)")
+	}
+
+	if s.tokenRefresher != nil {
+		go s.tokenRefresher.Start(ctx)
+	}
+
 	addr := fmt.Sprintf(":%d", s.config.Port)
 	log.Printf("API server starting on %s", addr)
 	return http.ListenAndServe(addr, s.handler)
