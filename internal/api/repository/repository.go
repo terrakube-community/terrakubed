@@ -277,6 +277,46 @@ func (r *GenericRepository) List(ctx context.Context, resourceType string, param
 }
 
 // FindByID returns a single row by primary key.
+// Count returns the total number of rows matching the given params (without pagination).
+// Used to populate JSON:API meta.page.totalRecords.
+func (r *GenericRepository) Count(ctx context.Context, resourceType string, params ListParams) (int, error) {
+	meta, ok := r.resources[resourceType]
+	if !ok {
+		return 0, fmt.Errorf("unknown resource type: %s", resourceType)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("SELECT COUNT(*) FROM ")
+	sb.WriteString(meta.Table)
+
+	var args []interface{}
+	argIdx := 1
+	var conditions []string
+
+	if meta.SoftDeleteColumn != "" {
+		conditions = append(conditions, fmt.Sprintf("%s IS NOT TRUE", meta.SoftDeleteColumn))
+	}
+	if params.ParentFK != "" && params.ParentID != nil {
+		conditions = append(conditions, fmt.Sprintf("%s = $%d", params.ParentFK, argIdx))
+		args = append(args, params.ParentID)
+		argIdx++
+	}
+	for col, val := range params.Filters {
+		conditions = append(conditions, fmt.Sprintf("%s = $%d", col, argIdx))
+		args = append(args, val)
+		argIdx++
+	}
+	_ = argIdx
+	if len(conditions) > 0 {
+		sb.WriteString(" WHERE ")
+		sb.WriteString(strings.Join(conditions, " AND "))
+	}
+
+	var count int
+	err := r.pool.QueryRow(ctx, sb.String(), args...).Scan(&count)
+	return count, err
+}
+
 func (r *GenericRepository) FindByID(ctx context.Context, resourceType string, id interface{}) (map[string]interface{}, error) {
 	meta, ok := r.resources[resourceType]
 	if !ok {

@@ -410,6 +410,20 @@ func (h *JSONAPIHandler) listResources(w http.ResponseWriter, r *http.Request, r
 
 	basePath := "/api/v1"
 	doc := jsonapi.SerializeList(config, rows, basePath)
+
+	// Add pagination meta when pagination is active (matching Elide's meta.page format)
+	if params.PageSize > 0 {
+		total, _ := h.repo.Count(r.Context(), resourceType, params)
+		doc.Meta = map[string]interface{}{
+			"page": map[string]interface{}{
+				"totalRecords": total,
+				"number":       params.PageOffset/params.PageSize + 1,
+				"size":         params.PageSize,
+				"totalPages":   (total + params.PageSize - 1) / params.PageSize,
+			},
+		}
+	}
+
 	writeJSON(w, http.StatusOK, doc)
 }
 
