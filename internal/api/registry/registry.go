@@ -58,6 +58,7 @@ func RegisterAll(repo *repository.GenericRepository) {
 			"workspaceTag": {ChildType: "workspacetag", FKColumn: "workspace_id"},
 			"access":       {ChildType: "access", FKColumn: "workspace_id"},
 			"reference":    {ChildType: "reference", FKColumn: "workspace_id"},
+			"webhook":      {ChildType: "webhook", FKColumn: "workspace_id"},
 		},
 	})
 

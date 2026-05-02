@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/terrakube-community/terrakubed/internal/api/jsonapi"
+	"github.com/terrakube-community/terrakubed/internal/api/middleware"
 	"github.com/terrakube-community/terrakubed/internal/api/repository"
 	"github.com/terrakube-community/terrakubed/internal/api/tcl"
 )
@@ -443,30 +445,47 @@ func (h *JSONAPIHandler) getResource(w http.ResponseWriter, r *http.Request, res
 	doc := jsonapi.SerializeSingle(config, row, basePath)
 
 	// Handle ?include=rel1,rel2,...
+	// Supports both to-many (child) and to-one (parent) relationships.
 	if includes := r.URL.Query().Get("include"); includes != "" {
 		for _, relName := range strings.Split(includes, ",") {
 			relName = strings.TrimSpace(relName)
-			childRel, ok := config.ChildRels[relName]
-			if !ok {
-				continue // Skip unknown relationships
-			}
-			childConfig, ok := h.configs[childRel.TargetType]
-			if !ok {
-				continue
-			}
 
-			childRows, err := h.repo.List(r.Context(), childRel.TargetType, repository.ListParams{
-				ParentFK: childRel.FKColumn,
-				ParentID: id,
-			})
-			if err != nil {
-				log.Printf("Error loading include %s for %s/%v: %v", relName, resourceType, id, err)
-				continue
-			}
+			if childRel, ok := config.ChildRels[relName]; ok {
+				// ── To-many: load children whose FK points to this resource ──
+				childConfig, ok := h.configs[childRel.TargetType]
+				if !ok {
+					continue
+				}
+				childRows, err := h.repo.List(r.Context(), childRel.TargetType, repository.ListParams{
+					ParentFK: childRel.FKColumn,
+					ParentID: id,
+				})
+				if err != nil {
+					log.Printf("Error loading include %s for %s/%v: %v", relName, resourceType, id, err)
+					continue
+				}
+				for _, childRow := range childRows {
+					doc.Included = append(doc.Included, jsonapi.Serialize(childConfig, childRow, basePath))
+				}
 
-			for _, childRow := range childRows {
-				doc.Included = append(doc.Included, jsonapi.Serialize(childConfig, childRow, basePath))
+			} else if parentRel, ok := config.ParentRels[relName]; ok {
+				// ── To-one: load the parent resource referenced by the FK on this row ──
+				fkVal := row[parentRel.FKColumn]
+				if fkVal == nil {
+					continue
+				}
+				parentConfig, ok := h.configs[parentRel.TargetType]
+				if !ok {
+					continue
+				}
+				// Pass the raw FK value directly — pgx handles UUID/int types natively
+				parentRow, err := h.repo.FindByID(r.Context(), parentRel.TargetType, fkVal)
+				if err != nil || parentRow == nil {
+					continue
+				}
+				doc.Included = append(doc.Included, jsonapi.Serialize(parentConfig, parentRow, basePath))
 			}
+			// unknown relationship: silently skip
 		}
 	}
 
@@ -496,6 +515,10 @@ func (h *JSONAPIHandler) createResource(w http.ResponseWriter, r *http.Request, 
 			data[meta.PKColumn] = uuid.New().String()
 		}
 	}
+
+	// Populate audit fields (created_by, updated_by, created_date, updated_date)
+	// only for columns that actually exist in the DB (validated at startup).
+	setAuditCreate(data, r, meta)
 
 	id, err := h.repo.Create(r.Context(), resourceType, data)
 	if err != nil {
@@ -543,6 +566,10 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 	}
 
 	data := jsonapi.Deserialize(config, reqDoc.Data)
+
+	// Populate audit fields for UPDATE (updated_by, updated_date)
+	meta, _ := h.repo.GetMeta(resourceType)
+	setAuditUpdate(data, r, meta)
 
 	if err := h.repo.Update(r.Context(), resourceType, id, data); err != nil {
 		log.Printf("Error updating %s/%v: %v", resourceType, id, err)
@@ -673,4 +700,65 @@ func toSnakeCase(s string) string {
 		}
 	}
 	return result.String()
+}
+
+// hasColumn reports whether the given DB column is registered (and thus exists) for the resource.
+func hasColumn(meta *repository.ResourceMeta, col string) bool {
+	if meta == nil {
+		return false
+	}
+	for _, c := range meta.Columns {
+		if c == col {
+			return true
+		}
+	}
+	return false
+}
+
+// setAuditCreate populates created_by, updated_by, created_date, updated_date
+// on a new-resource data map from the authenticated request user.
+// Only sets fields whose columns actually exist in the DB (safe to call unconditionally).
+func setAuditCreate(data map[string]interface{}, r *http.Request, meta *repository.ResourceMeta) {
+	now := time.Now()
+	email := ""
+	if user := middleware.GetUser(r.Context()); user != nil {
+		email = user.Email
+	}
+
+	if hasColumn(meta, "created_by") {
+		if _, already := data["created_by"]; !already {
+			data["created_by"] = email
+		}
+	}
+	if hasColumn(meta, "updated_by") {
+		if _, already := data["updated_by"]; !already {
+			data["updated_by"] = email
+		}
+	}
+	if hasColumn(meta, "created_date") {
+		if _, already := data["created_date"]; !already {
+			data["created_date"] = now
+		}
+	}
+	if hasColumn(meta, "updated_date") {
+		if _, already := data["updated_date"]; !already {
+			data["updated_date"] = now
+		}
+	}
+}
+
+// setAuditUpdate populates updated_by and updated_date on an update data map.
+func setAuditUpdate(data map[string]interface{}, r *http.Request, meta *repository.ResourceMeta) {
+	now := time.Now()
+	email := ""
+	if user := middleware.GetUser(r.Context()); user != nil {
+		email = user.Email
+	}
+
+	if hasColumn(meta, "updated_by") {
+		data["updated_by"] = email
+	}
+	if hasColumn(meta, "updated_date") {
+		data["updated_date"] = now
+	}
 }
