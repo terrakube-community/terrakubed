@@ -102,7 +102,8 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		       COALESCE(NULLIF(j.override_branch,''), w.branch),
 		       w.folder, w.terraform_version, w.iac_type,
 		       w.module_ssh_key,
-		       COALESCE(v.vcs_type,''), COALESCE(v.connection_type,''), COALESCE(v.access_token,'')
+		       COALESCE(v.vcs_type,''), COALESCE(v.connection_type,''), COALESCE(v.access_token,''),
+		       COALESCE(w.vcs_id::text,'')
 		FROM job j
 		JOIN workspace w ON j.workspace_id = w.id
 		LEFT JOIN vcs v ON w.vcs_id = v.id
@@ -135,6 +136,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			vcsType          string
 			connectionType   string
 			accessToken      string
+			vcsID            string
 		)
 
 		if err := rows.Scan(
@@ -143,6 +145,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			&source, &branch, &folder, &terraformVersion, &iacType,
 			&moduleSshKey,
 			&vcsType, &connectionType, &accessToken,
+			&vcsID,
 		); err != nil {
 			log.Printf("pollJobs scan error: %v", err)
 			continue
@@ -210,6 +213,16 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		}
 
 		// ── terraform / custom step → K8s executor ───────────────────────────
+
+		// Ensure the VCS access token is fresh (GitLab/Bitbucket tokens expire after 2h).
+		// GetFreshToken returns the stored token without a round-trip when it is still valid.
+		freshToken := accessToken
+		if vcsID != "" {
+			if t, err := vcs.GetFreshToken(ctx, s.pool, vcsID); err == nil {
+				freshToken = t
+			}
+		}
+
 		execCtx := &ExecutionContext{
 			OrganizationID:   orgID,
 			WorkspaceID:      workspaceID,
@@ -222,7 +235,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			TerraformVersion: deref(terraformVersion),
 			VcsType:          vcsType,
 			ConnectionType:   connectionType,
-			AccessToken:      accessToken,
+			AccessToken:      freshToken,
 			ModuleSshKey:     deref(moduleSshKey),
 			CommitID:         deref(commitID),
 			Refresh:          refresh,

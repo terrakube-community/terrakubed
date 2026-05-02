@@ -21,6 +21,7 @@ type JSONAPIHandler struct {
 	repo         *repository.GenericRepository
 	configs      map[string]*jsonapi.ResourceConfig
 	tclProcessor *tcl.Processor
+	pool         *pgxpool.Pool
 }
 
 // NewJSONAPIHandler creates a new handler.
@@ -33,8 +34,9 @@ func NewJSONAPIHandler(repo *repository.GenericRepository) *JSONAPIHandler {
 	return h
 }
 
-// WithPool wires the DB pool for lifecycle hooks (TCL step init, etc.).
+// WithPool wires the DB pool for lifecycle hooks (TCL step init, workspace unlock, etc.).
 func (h *JSONAPIHandler) WithPool(pool *pgxpool.Pool) *JSONAPIHandler {
+	h.pool = pool
 	h.tclProcessor = tcl.NewProcessor(pool)
 	return h
 }
@@ -532,6 +534,30 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 		log.Printf("Error updating %s/%v: %v", resourceType, id, err)
 		writeError(w, http.StatusInternalServerError, "Failed to update resource")
 		return
+	}
+
+	// Post-update lifecycle hooks
+	if resourceType == "job" && h.pool != nil {
+		if newStatus, ok := data["status"].(string); ok {
+			switch newStatus {
+			case "completed", "failed", "noChanges", "rejected":
+				// Unlock the workspace when a job reaches any terminal state.
+				// The executor K8s pod updates job status directly via API; the scheduler
+				// doesn't see terminal-state jobs in its poll loop so workspace unlock
+				// must happen here instead.
+				go func(jobID interface{}, status string) {
+					ctx := r.Context()
+					_, err := h.pool.Exec(ctx,
+						`UPDATE workspace SET locked = false
+						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`,
+						jobID)
+					if err != nil {
+						log.Printf("Failed to unlock workspace for job %v: %v", jobID, err)
+					}
+					log.Printf("Job %v reached terminal state %q — workspace unlocked", jobID, status)
+				}(id, newStatus)
+			}
+		}
 	}
 
 	// Reload and return
