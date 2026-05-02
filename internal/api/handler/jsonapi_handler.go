@@ -213,6 +213,52 @@ func (h *JSONAPIHandler) handleRelated(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 
+	parentID, err := parseID(parentIDStr, h.repo, parentType)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// ── To-one (parent) relationship navigation: GET /api/v1/{type}/{id}/{parentRel} ──
+	if toOneRel, isParent := parentConfig.ParentRels[relName]; isParent {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		// Load the source row to get the FK value
+		sourceRow, err := h.repo.FindByID(r.Context(), parentType, parentID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if sourceRow == nil {
+			writeError(w, http.StatusNotFound, "Resource not found")
+			return
+		}
+		fkVal := sourceRow[toOneRel.FKColumn]
+		if fkVal == nil {
+			// No related resource (null FK)
+			w.Header().Set("Content-Type", "application/vnd.api+json")
+			writeJSON(w, http.StatusOK, jsonapi.Document{Data: nil})
+			return
+		}
+		relConfig, ok := h.configs[toOneRel.TargetType]
+		if !ok {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("Unknown type: %s", toOneRel.TargetType))
+			return
+		}
+		relRow, err := h.repo.FindByID(r.Context(), toOneRel.TargetType, fkVal)
+		if err != nil || relRow == nil {
+			writeError(w, http.StatusNotFound, "Related resource not found")
+			return
+		}
+		basePath := "/api/v1"
+		writeJSON(w, http.StatusOK, jsonapi.SerializeSingle(relConfig, relRow, basePath))
+		return
+	}
+
+	// ── To-many (child) relationship navigation ──
+
 	// Check child relationships
 	childRel, ok := parentConfig.ChildRels[relName]
 	if !ok {
@@ -223,12 +269,6 @@ func (h *JSONAPIHandler) handleRelated(w http.ResponseWriter, r *http.Request, p
 	childConfig, ok := h.configs[childRel.TargetType]
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Unknown child type: %s", childRel.TargetType))
-		return
-	}
-
-	parentID, err := parseID(parentIDStr, h.repo, parentType)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -423,6 +463,64 @@ func (h *JSONAPIHandler) listResources(w http.ResponseWriter, r *http.Request, r
 				"size":         params.PageSize,
 				"totalPages":   (total + params.PageSize - 1) / params.PageSize,
 			},
+		}
+	}
+
+	// Handle ?include= on list responses: sideload related resources for every item.
+	// Tracks already-included IDs to avoid duplicates across the list.
+	if includes := r.URL.Query().Get("include"); includes != "" {
+		included := make(map[string]bool) // "type:id" dedup key
+		for _, row := range rows {
+			for _, relName := range strings.Split(includes, ",") {
+				relName = strings.TrimSpace(relName)
+
+				if childRel, ok := config.ChildRels[relName]; ok {
+					childConfig, ok := h.configs[childRel.TargetType]
+					if !ok {
+						continue
+					}
+					// Get the PK of this row to use as parent FK filter
+					pkVal := row[config.PKColumn]
+					if pkVal == nil {
+						continue
+					}
+					childRows, err := h.repo.List(r.Context(), childRel.TargetType, repository.ListParams{
+						ParentFK: childRel.FKColumn,
+						ParentID: pkVal,
+					})
+					if err != nil {
+						continue
+					}
+					childMeta, _ := h.repo.GetMeta(childRel.TargetType)
+					for _, childRow := range childRows {
+						key := fmt.Sprintf("%s:%v", childRel.TargetType, childRow[childMeta.PKColumn])
+						if !included[key] {
+							included[key] = true
+							doc.Included = append(doc.Included, jsonapi.Serialize(childConfig, childRow, basePath))
+						}
+					}
+
+				} else if parentRel, ok := config.ParentRels[relName]; ok {
+					fkVal := row[parentRel.FKColumn]
+					if fkVal == nil {
+						continue
+					}
+					parentConfig, ok := h.configs[parentRel.TargetType]
+					if !ok {
+						continue
+					}
+					key := fmt.Sprintf("%s:%v", parentRel.TargetType, fkVal)
+					if included[key] {
+						continue
+					}
+					parentRow, err := h.repo.FindByID(r.Context(), parentRel.TargetType, fkVal)
+					if err != nil || parentRow == nil {
+						continue
+					}
+					included[key] = true
+					doc.Included = append(doc.Included, jsonapi.Serialize(parentConfig, parentRow, basePath))
+				}
+			}
 		}
 	}
 
