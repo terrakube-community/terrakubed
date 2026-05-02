@@ -1,11 +1,14 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -57,6 +60,47 @@ type ExecutionContext struct {
 	TFVars           map[string]string `json:"variables"`
 }
 
+// AgentExecutor dispatches jobs to a remote Terrakube agent via HTTP POST.
+// The agent receives the ExecutionContext as JSON and runs the job locally.
+type AgentExecutor struct {
+	agentURL   string
+	httpClient *http.Client
+}
+
+func newAgentExecutor(agentURL string) *AgentExecutor {
+	return &AgentExecutor{
+		agentURL:   strings.TrimRight(agentURL, "/"),
+		httpClient: &http.Client{Timeout: 15 * time.Second},
+	}
+}
+
+func (a *AgentExecutor) Execute(ctx context.Context, execCtx *ExecutionContext) error {
+	body, err := json.Marshal(execCtx)
+	if err != nil {
+		return fmt.Errorf("failed to marshal execution context: %w", err)
+	}
+
+	url := a.agentURL + "/api/v1/execute"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to build agent request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("agent request to %s failed: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("agent returned HTTP %d", resp.StatusCode)
+	}
+
+	log.Printf("Job %d step %s dispatched to agent %s", execCtx.JobID, execCtx.StepID, a.agentURL)
+	return nil
+}
+
 // NewJobScheduler creates a new scheduler.
 func NewJobScheduler(pool *pgxpool.Pool, executor Executor, interval time.Duration) *JobScheduler {
 	return &JobScheduler{
@@ -103,10 +147,12 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		       w.folder, w.terraform_version, w.iac_type,
 		       w.module_ssh_key,
 		       COALESCE(v.vcs_type,''), COALESCE(v.connection_type,''), COALESCE(v.access_token,''),
-		       COALESCE(w.vcs_id::text,'')
+		       COALESCE(w.vcs_id::text,''),
+		       COALESCE(a.url,'')
 		FROM job j
 		JOIN workspace w ON j.workspace_id = w.id
 		LEFT JOIN vcs v ON w.vcs_id = v.id
+		LEFT JOIN agent a ON w.agent_id = a.id
 		WHERE j.status IN ('pending', 'queue')
 		ORDER BY j.id ASC
 		LIMIT 10
@@ -137,6 +183,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			connectionType   string
 			accessToken      string
 			vcsID            string
+			agentURL         string
 		)
 
 		if err := rows.Scan(
@@ -145,7 +192,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			&source, &branch, &folder, &terraformVersion, &iacType,
 			&moduleSshKey,
 			&vcsType, &connectionType, &accessToken,
-			&vcsID,
+			&vcsID, &agentURL,
 		); err != nil {
 			log.Printf("pollJobs scan error: %v", err)
 			continue
@@ -257,17 +304,32 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		// Post "pending" commit status at the start of a run
 		go s.postCommitStatusForStep(ctx, jobID, stepType)
 
-		go func(jID int, sID, wsID string, ec *ExecutionContext) {
-			if err := s.executor.Execute(ctx, ec); err != nil {
+		// Choose executor: agent pool takes priority over K8s ephemeral executor
+		var chosenExecutor Executor
+		if agentURL != "" {
+			chosenExecutor = newAgentExecutor(agentURL)
+			log.Printf("Job %d step %s: routing to agent at %s", jobID, stepID, agentURL)
+		} else if s.executor != nil {
+			chosenExecutor = s.executor
+		} else {
+			log.Printf("Job %d: no executor available (K8s executor not configured and no agent URL), skipping", jobID)
+			s.pool.Exec(ctx, "UPDATE step SET status = 'failed' WHERE id = $1", stepID)
+			s.pool.Exec(ctx, "UPDATE job SET status = 'failed' WHERE id = $1", jobID)
+			s.pool.Exec(ctx, "UPDATE workspace SET locked = false WHERE id = $1", workspaceID)
+			continue
+		}
+
+		go func(jID int, sID, wsID string, ec *ExecutionContext, exec Executor) {
+			if err := exec.Execute(ctx, ec); err != nil {
 				log.Printf("Job %d step %s failed: %v", jID, sID, err)
 				s.pool.Exec(ctx, "UPDATE step SET status = 'failed' WHERE id = $1", sID)
 				s.pool.Exec(ctx, "UPDATE job SET status = 'failed' WHERE id = $1", jID)
 				// Unlock workspace on executor failure so future jobs can run
 				s.pool.Exec(ctx, "UPDATE workspace SET locked = false WHERE id = $1", wsID)
 			}
-			// On success: executor pod updates status via API callbacks when it completes.
-			// maybeUnlockWorkspace is called after the final step completes.
-		}(jobID, stepID, workspaceID, execCtx)
+			// On success: executor updates status via API callbacks when it completes.
+			// Workspace unlock happens in the JSONAPI handler on terminal status.
+		}(jobID, stepID, workspaceID, execCtx, chosenExecutor)
 	}
 }
 

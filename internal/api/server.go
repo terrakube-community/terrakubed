@@ -154,6 +154,11 @@ func NewServer(config Config) (*Server, error) {
 	approvalHandler := handler.NewApprovalHandler(db.Pool)
 	mux.Handle("/approval/v1/", approvalHandler)
 
+	// /app/{orgId}/{wsId}/runs/{jobId} → redirect to UI run page
+	// Used by Slack notifications when TERRAKUBE_UI_URL isn't set on the executor
+	appRedirectHandler := handler.NewAppRedirectHandler(config.UIURL)
+	mux.Handle("/app/", appRedirectHandler)
+
 	// State & TFE endpoints
 	mux.Handle("/tfstate/v1/", stateHandler)
 	mux.Handle("/remote/tfe/v2/", tfeHandler)
