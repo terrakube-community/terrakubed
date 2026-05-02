@@ -106,7 +106,12 @@ func (h *ApprovalHandler) reject(w http.ResponseWriter, r *http.Request, jobID s
 		"UPDATE step SET status = 'notExecuted' WHERE job_id = $1 AND status = 'pending'", jobID)
 	h.pool.Exec(ctx, "UPDATE job SET status = 'rejected' WHERE id = $1", jobID)
 
-	log.Printf("Job %s rejected", jobID)
+	// Unlock the workspace — the JSONAPI hook won't fire here since we update via direct SQL
+	h.pool.Exec(ctx,
+		`UPDATE workspace SET locked = false, last_job_status = 'rejected', last_job_date = NOW()
+		 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID)
+
+	log.Printf("Job %s rejected — workspace unlocked", jobID)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "rejected"})
