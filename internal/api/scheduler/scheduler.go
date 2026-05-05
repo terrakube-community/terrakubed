@@ -231,10 +231,11 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 
 		// ── approval step ────────────────────────────────────────────────────
 		if stepType == "approval" {
-			// Check if workspace has auto-apply enabled — skip approval if so
+			// Check if job has auto-apply enabled — skip approval if so.
+			// auto_apply is a job-level field (set at job creation time from template/UI).
 			var autoApply bool
 			s.pool.QueryRow(ctx,
-				"SELECT COALESCE(auto_apply, false) FROM workspace WHERE id = $1", workspaceID,
+				"SELECT COALESCE(auto_apply, false) FROM job WHERE id = $1", jobID,
 			).Scan(&autoApply)
 
 			if autoApply {

@@ -486,9 +486,10 @@ type Agent struct {
 // Webhook — table "webhook"
 type Webhook struct {
 	AuditFields
-	ID           uuid.UUID `json:"id"           db:"id"`
-	RemoteHookID string    `json:"remoteHookId" db:"remote_hook_id"`
-	WorkspaceID  uuid.UUID `json:"workspaceId"  db:"workspace_id"`
+	ID             uuid.UUID `json:"id"             db:"id"`
+	RemoteHookID   string    `json:"remoteHookId"   db:"remote_hook_id"`
+	WebhookToken   string    `json:"webhookToken"   db:"webhook_token"`
+	WorkspaceID    uuid.UUID `json:"workspaceId"    db:"workspace_id"`
 }
 
 // WebhookEvent — table "webhook_event"

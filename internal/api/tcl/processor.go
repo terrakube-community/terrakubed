@@ -78,7 +78,10 @@ func (p *Processor) InitJobSteps(ctx context.Context, jobID int) error {
 	}
 
 	if tcl == "" {
-		return fmt.Errorf("job %d has no TCL and no template reference", jobID)
+		// No inline TCL and no template — fall back to the default plan-only flow.
+		// This mirrors Java's behaviour: new workspaces run a terraformPlan by default.
+		tcl = defaultPlanTCL
+		log.Printf("Job %d: no TCL or template, using default plan flow", jobID)
 	}
 
 	flowConfig, err := parseTCL(tcl)
@@ -142,3 +145,12 @@ func ParseFlow(encoded string) ([]Flow, error) {
 	}
 	return cfg.Flow, nil
 }
+
+// defaultPlanTCL is a base64-encoded YAML document for a single-step plan flow.
+// Used when a job has no inline TCL and no template reference configured.
+//
+//	flow:
+//	  - type: terraformPlan
+//	    step: 100
+//	    name: "Plan"
+const defaultPlanTCL = "ZmxvdzoKICAtIHR5cGU6IHRlcnJhZm9ybVBsYW4KICAgIHN0ZXA6IDEwMAogICAgbmFtZTogIlBsYW4iCg=="
