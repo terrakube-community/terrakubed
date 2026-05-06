@@ -387,6 +387,10 @@ func (r *GenericRepository) Create(ctx context.Context, resourceType string, dat
 		if col == meta.PKColumn && val == nil {
 			continue
 		}
+		if !isSafeColumnName(col) {
+			log.Printf("Create(%s): skipping column with unsafe name %q", resourceType, col)
+			continue
+		}
 		cols = append(cols, col)
 		placeholders = append(placeholders, fmt.Sprintf("$%d", argIdx))
 		args = append(args, val)
@@ -422,6 +426,10 @@ func (r *GenericRepository) Update(ctx context.Context, resourceType string, id 
 	for col, val := range data {
 		if col == meta.PKColumn {
 			continue // Don't update PK
+		}
+		if !isSafeColumnName(col) {
+			log.Printf("Update(%s/%v): skipping column with unsafe name %q", resourceType, id, col)
+			continue
 		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", col, argIdx))
 		args = append(args, val)
