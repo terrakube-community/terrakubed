@@ -265,18 +265,25 @@ func decodeJWTClaims(token string) (*UserInfo, error) {
 		return nil, fmt.Errorf("failed to decode JWT payload: %w", err)
 	}
 
+	// Decode into raw map first to handle groups as []interface{} robustly
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return nil, fmt.Errorf("failed to parse JWT claims: %w", err)
+	}
+
 	var claims UserInfo
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return nil, fmt.Errorf("failed to parse JWT claims: %w", err)
 	}
 
-	// Parse groups from different claim formats
-	var raw map[string]interface{}
-	json.Unmarshal(payload, &raw)
-	if groups, ok := raw["groups"]; ok {
-		switch g := groups.(type) {
-		case []interface{}:
-			for _, v := range g {
+	// Re-parse groups from raw to handle heterogeneous arrays ([]interface{}).
+	// json.Unmarshal into []string fails silently if the JSON array contains
+	// non-string elements, so we do it explicitly and replace any result.
+	if raw["groups"] != nil {
+		var groupsRaw []interface{}
+		if json.Unmarshal(raw["groups"], &groupsRaw) == nil {
+			claims.Groups = nil // reset to avoid duplicates if []string already worked
+			for _, v := range groupsRaw {
 				if s, ok := v.(string); ok {
 					claims.Groups = append(claims.Groups, s)
 				}
