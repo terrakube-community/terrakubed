@@ -300,12 +300,15 @@ func (r *GenericRepository) Count(ctx context.Context, resourceType string, para
 	if meta.SoftDeleteColumn != "" {
 		conditions = append(conditions, fmt.Sprintf("%s IS NOT TRUE", meta.SoftDeleteColumn))
 	}
-	if params.ParentFK != "" && params.ParentID != nil {
+	if params.ParentFK != "" && params.ParentID != nil && isSafeColumnName(params.ParentFK) {
 		conditions = append(conditions, fmt.Sprintf("%s = $%d", params.ParentFK, argIdx))
 		args = append(args, params.ParentID)
 		argIdx++
 	}
 	for col, val := range params.Filters {
+		if !isSafeColumnName(col) {
+			continue
+		}
 		conditions = append(conditions, fmt.Sprintf("%s = $%d", col, argIdx))
 		args = append(args, val)
 		argIdx++
