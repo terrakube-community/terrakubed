@@ -218,14 +218,18 @@ func (r *GenericRepository) List(ctx context.Context, resourceType string, param
 	}
 
 	// Parent FK filter
-	if params.ParentFK != "" && params.ParentID != nil {
+	if params.ParentFK != "" && params.ParentID != nil && isSafeColumnName(params.ParentFK) {
 		conditions = append(conditions, fmt.Sprintf("%s = $%d", params.ParentFK, argIdx))
 		args = append(args, params.ParentID)
 		argIdx++
 	}
 
-	// Additional filters
+	// Additional filters — validate column names to prevent SQL injection
 	for col, val := range params.Filters {
+		if !isSafeColumnName(col) {
+			log.Printf("List(%s): ignoring filter with unsafe column name %q", resourceType, col)
+			continue
+		}
 		conditions = append(conditions, fmt.Sprintf("%s = $%d", col, argIdx))
 		args = append(args, val)
 		argIdx++
