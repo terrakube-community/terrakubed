@@ -78,7 +78,7 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // ──────────────────────────────────────────────────
 
 type githubPushEvent struct {
-	Ref        string `json:"ref"` // "refs/heads/main"
+	Ref        string `json:"ref"` // "refs/heads/main" or "refs/tags/v1.0"
 	HeadCommit struct {
 		ID string `json:"id"`
 	} `json:"head_commit"`
@@ -119,11 +119,25 @@ func (h *WebhookHandler) handleGitHub(w http.ResponseWriter, r *http.Request, we
 		return
 	}
 
-	// Extract branch from ref (refs/heads/main → main)
-	branch := strings.TrimPrefix(push.Ref, "refs/heads/")
+	// Determine event type and extract branch/tag name from ref
+	var pushBranch string
+	var eventType string // "PUSH" or "TAG"
+
+	switch {
+	case strings.HasPrefix(push.Ref, "refs/heads/"):
+		pushBranch = strings.TrimPrefix(push.Ref, "refs/heads/")
+		eventType = "PUSH"
+	case strings.HasPrefix(push.Ref, "refs/tags/"):
+		pushBranch = strings.TrimPrefix(push.Ref, "refs/tags/")
+		eventType = "TAG"
+	default:
+		pushBranch = push.Ref
+		eventType = "PUSH"
+	}
+
 	commitID := push.HeadCommit.ID
 
-	if err := h.triggerJob(r.Context(), workspaceID, branch, commitID, "github"); err != nil {
+	if err := h.triggerJob(r.Context(), workspaceID, webhookID, pushBranch, commitID, eventType, "github"); err != nil {
 		log.Printf("Failed to trigger job for workspace %s: %v", workspaceID, err)
 		http.Error(w, "failed to trigger job", http.StatusInternalServerError)
 		return
@@ -149,13 +163,20 @@ func verifyGitHubSignature(secret, signature string, body []byte) bool {
 // ──────────────────────────────────────────────────
 
 type gitlabPushEvent struct {
-	Ref        string `json:"ref"`
+	Ref         string `json:"ref"`
 	CheckoutSHA string `json:"checkout_sha"`
 }
 
 func (h *WebhookHandler) handleGitLab(w http.ResponseWriter, r *http.Request, webhookID string, body []byte) {
-	event := r.Header.Get("X-Gitlab-Event")
-	if event != "Push Hook" && event != "Tag Push Hook" {
+	glEvent := r.Header.Get("X-Gitlab-Event")
+
+	var eventType string
+	switch glEvent {
+	case "Push Hook":
+		eventType = "PUSH"
+	case "Tag Push Hook":
+		eventType = "TAG"
+	default:
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"message":"event ignored"}`))
 		return
@@ -182,8 +203,14 @@ func (h *WebhookHandler) handleGitLab(w http.ResponseWriter, r *http.Request, we
 		return
 	}
 
-	branch := strings.TrimPrefix(push.Ref, "refs/heads/")
-	if err := h.triggerJob(r.Context(), workspaceID, branch, push.CheckoutSHA, "gitlab"); err != nil {
+	var pushBranch string
+	if eventType == "TAG" {
+		pushBranch = strings.TrimPrefix(push.Ref, "refs/tags/")
+	} else {
+		pushBranch = strings.TrimPrefix(push.Ref, "refs/heads/")
+	}
+
+	if err := h.triggerJob(r.Context(), workspaceID, webhookID, pushBranch, push.CheckoutSHA, eventType, "gitlab"); err != nil {
 		log.Printf("Failed to trigger job for workspace %s: %v", workspaceID, err)
 		http.Error(w, "failed to trigger job", http.StatusInternalServerError)
 		return
@@ -201,6 +228,7 @@ type bitbucketPushEvent struct {
 	Push struct {
 		Changes []struct {
 			New struct {
+				Type   string `json:"type"` // "branch" or "tag"
 				Name   string `json:"name"`
 				Target struct {
 					Hash string `json:"hash"`
@@ -236,7 +264,11 @@ func (h *WebhookHandler) handleBitbucket(w http.ResponseWriter, r *http.Request,
 		if branch == "" {
 			continue
 		}
-		if err := h.triggerJob(r.Context(), workspaceID, branch, commitID, "bitbucket"); err != nil {
+		eventType := "PUSH"
+		if change.New.Type == "tag" {
+			eventType = "TAG"
+		}
+		if err := h.triggerJob(r.Context(), workspaceID, webhookID, branch, commitID, eventType, "bitbucket"); err != nil {
 			log.Printf("Failed to trigger job for workspace %s branch %s: %v", workspaceID, branch, err)
 		}
 	}
@@ -261,9 +293,77 @@ func (h *WebhookHandler) loadWebhook(ctx context.Context, webhookID string) (sec
 	return secret, workspaceID, nil
 }
 
+// webhookEventMatch holds a matched webhook_event record.
+type webhookEventMatch struct {
+	branch     string
+	templateID string
+	eventType  string // "PUSH" or "TAG"
+}
+
+// resolveWebhookTemplate queries webhook_event rows for the webhook and returns
+// the template_id from the first matching event (ordered by priority).
+// Falls back to "" if no match — callers should then use workspace/org defaults.
+func (h *WebhookHandler) resolveWebhookTemplate(ctx context.Context, webhookID, pushBranch, eventType string) string {
+	rows, err := h.pool.Query(ctx,
+		`SELECT COALESCE(branch,''), COALESCE(template_id,''), COALESCE(event,'PUSH')
+		 FROM webhook_event
+		 WHERE webhook_id = $1
+		 ORDER BY priority`,
+		webhookID,
+	)
+	if err != nil {
+		log.Printf("Webhook: failed to query webhook_event for %s: %v", webhookID, err)
+		return ""
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var evBranch, evTemplate, evType string
+		if err := rows.Scan(&evBranch, &evTemplate, &evType); err != nil {
+			continue
+		}
+
+		// Event type must match (PUSH or TAG)
+		if evType != "" && evType != eventType {
+			continue
+		}
+
+		// Branch must match (empty branch = matches all)
+		if evBranch != "" && !branchMatches(evBranch, pushBranch) {
+			continue
+		}
+
+		if evTemplate != "" {
+			log.Printf("Webhook: event match branch=%q type=%q → template=%s", evBranch, evType, evTemplate)
+			return evTemplate
+		}
+		// Matched event with no specific template — stop searching (explicit no-override)
+		return ""
+	}
+
+	return ""
+}
+
+// branchMatches checks if pushBranch matches the event branch pattern.
+// Supports exact match and wildcard suffix (e.g. "feature/*").
+func branchMatches(pattern, branch string) bool {
+	if pattern == branch {
+		return true
+	}
+	if strings.HasSuffix(pattern, "/*") {
+		prefix := strings.TrimSuffix(pattern, "/*")
+		return strings.HasPrefix(branch, prefix+"/")
+	}
+	if strings.HasSuffix(pattern, "*") {
+		prefix := strings.TrimSuffix(pattern, "*")
+		return strings.HasPrefix(branch, prefix)
+	}
+	return false
+}
+
 // triggerJob creates a job + steps for the given workspace if the branch matches.
 // It mirrors Java's WebhookServiceImpl.createJob().
-func (h *WebhookHandler) triggerJob(ctx context.Context, workspaceID, pushBranch, commitID, via string) error {
+func (h *WebhookHandler) triggerJob(ctx context.Context, workspaceID, webhookID, pushBranch, commitID, eventType, via string) error {
 	// Load workspace — check branch matches and workspace is not locked
 	var (
 		orgID            string
@@ -282,17 +382,9 @@ func (h *WebhookHandler) triggerJob(ctx context.Context, workspaceID, pushBranch
 		return fmt.Errorf("workspace %s not found: %w", workspaceID, err)
 	}
 
-	// Try org-level default template as fallback (column may not exist in all deployments)
-	var defaultTemplate string
-	if templateRef == "" {
-		_ = h.pool.QueryRow(ctx,
-			`SELECT COALESCE(default_template,'') FROM organization WHERE id = $1`,
-			orgID,
-		).Scan(&defaultTemplate)
-	}
-
-	// Only trigger if the push branch matches the workspace branch
-	if wsBranch != "" && wsBranch != pushBranch {
+	// Only trigger if the push branch matches the workspace branch (branch push only).
+	// Tag events are not filtered by workspace branch setting.
+	if eventType == "PUSH" && wsBranch != "" && wsBranch != pushBranch {
 		log.Printf("Webhook: workspace %s branch=%s does not match push branch=%s, skipping", workspaceID, wsBranch, pushBranch)
 		return nil
 	}
@@ -302,10 +394,17 @@ func (h *WebhookHandler) triggerJob(ctx context.Context, workspaceID, pushBranch
 		return nil
 	}
 
-	// Resolve template reference
-	resolvedTemplate := templateRef
+	// Resolve template: webhook_event match → workspace default → org default
+	resolvedTemplate := h.resolveWebhookTemplate(ctx, webhookID, pushBranch, eventType)
 	if resolvedTemplate == "" {
-		resolvedTemplate = defaultTemplate
+		resolvedTemplate = templateRef
+	}
+	if resolvedTemplate == "" {
+		// Try org-level default template as final fallback
+		_ = h.pool.QueryRow(ctx,
+			`SELECT COALESCE(default_template,'') FROM organization WHERE id = $1`,
+			orgID,
+		).Scan(&resolvedTemplate)
 	}
 
 	// Create job
@@ -333,8 +432,8 @@ func (h *WebhookHandler) triggerJob(ctx context.Context, workspaceID, pushBranch
 		return fmt.Errorf("create job: %w", err)
 	}
 
-	log.Printf("Webhook (%s): created job %d for workspace %s (branch=%s commit=%s)",
-		via, jobID, workspaceID, pushBranch, commitID)
+	log.Printf("Webhook (%s): created job %d for workspace %s (branch=%s commit=%s eventType=%s)",
+		via, jobID, workspaceID, pushBranch, commitID, eventType)
 
 	// Create steps from TCL
 	if err := h.tclProcessor.InitJobSteps(ctx, jobID); err != nil {
