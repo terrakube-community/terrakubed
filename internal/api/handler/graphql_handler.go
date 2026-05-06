@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -99,12 +100,12 @@ func (h *GraphQLHandler) executeQuery(r *http.Request, query string, variables m
 	// Parse the root resource type from the query
 	// Pattern: { resourceType { edges { node { field1 field2 } } } }
 	// or: { resourceType(ids: ["..."]) { edges { node { field1 field2 } } } }
-	rootType, ids, fields, relationships := parseGraphQLQuery(query)
+	rootType, ids, fields, relationships, pageParams := parseGraphQLQuery(query)
 	if rootType == "" {
 		return nil, fmt.Errorf("could not parse query")
 	}
 
-	log.Printf("GraphQL: type=%s ids=%v fields=%v rels=%v", rootType, ids, fields, relationships)
+	log.Printf("GraphQL: type=%s ids=%v fields=%v rels=%v page=%+v", rootType, ids, fields, relationships, pageParams)
 
 	// Check if the resource type is registered
 	meta, ok := h.repo.GetMeta(rootType)
@@ -118,8 +119,8 @@ func (h *GraphQLHandler) executeQuery(r *http.Request, query string, variables m
 		return h.fetchByIDs(ctx, rootType, meta, ids, fields, relationships)
 	}
 
-	// List all records
-	return h.fetchAll(ctx, rootType, meta, fields, relationships)
+	// List all records (with optional pagination)
+	return h.fetchAll(ctx, rootType, meta, fields, relationships, pageParams)
 }
 
 func (h *GraphQLHandler) fetchByIDs(ctx context.Context, resourceType string, meta *repository.ResourceMeta, ids []string, fields []string, relationships []relInfo) (interface{}, error) {
@@ -152,8 +153,18 @@ func (h *GraphQLHandler) fetchByIDs(ctx context.Context, resourceType string, me
 	}, nil
 }
 
-func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta *repository.ResourceMeta, fields []string, relationships []relInfo) (interface{}, error) {
-	rows, err := h.repo.List(ctx, resourceType, repository.ListParams{})
+func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta *repository.ResourceMeta, fields []string, relationships []relInfo, page gqlPage) (interface{}, error) {
+	params := repository.ListParams{}
+	if page.sort != "" {
+		params.Sort = page.sort
+	}
+	if page.size > 0 {
+		params.PageSize = page.size
+		if page.number > 1 {
+			params.PageOffset = (page.number - 1) * page.size
+		}
+	}
+	rows, err := h.repo.List(ctx, resourceType, params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list %s: %w", resourceType, err)
 	}
@@ -355,6 +366,13 @@ type relInfo struct {
 	rels   []relInfo // nested relationships
 }
 
+// gqlPage holds optional pagination params parsed from a GraphQL query.
+type gqlPage struct {
+	size   int // 0 = no limit
+	number int // 1-based
+	sort   string
+}
+
 var (
 	// Matches root type: { organization { ... } }
 	rootTypeRe = regexp.MustCompile(`(?:query\s*(?:\w+)?\s*)?[{]\s*(\w+)`)
@@ -362,9 +380,15 @@ var (
 	idsRe = regexp.MustCompile(`\(\s*ids?\s*:\s*\[([^\]]*)\]`)
 	// Matches single id filter: (id: "uuid")
 	singleIDRe = regexp.MustCompile(`\(\s*ids?\s*:\s*"([^"]+)"`)
+	// Matches pagination: (pagination: {number: N, size: M})
+	pageRe = regexp.MustCompile(`pagination\s*:\s*\{[^}]*number\s*:\s*(\d+)[^}]*size\s*:\s*(\d+)[^}]*\}`)
+	pageRe2 = regexp.MustCompile(`pagination\s*:\s*\{[^}]*size\s*:\s*(\d+)[^}]*number\s*:\s*(\d+)[^}]*\}`)
+	// Matches first/offset: (first: N, offset: M)
+	firstRe  = regexp.MustCompile(`first\s*:\s*(\d+)`)
+	offsetRe = regexp.MustCompile(`offset\s*:\s*(\d+)`)
 )
 
-func parseGraphQLQuery(query string) (rootType string, ids []string, fields []string, relationships []relInfo) {
+func parseGraphQLQuery(query string) (rootType string, ids []string, fields []string, relationships []relInfo, page gqlPage) {
 	// Extract root type
 	matches := rootTypeRe.FindStringSubmatch(query)
 	if len(matches) < 2 {
@@ -388,6 +412,38 @@ func parseGraphQLQuery(query string) (rootType string, ids []string, fields []st
 		}
 	} else if singleMatch := singleIDRe.FindStringSubmatch(inner); len(singleMatch) >= 2 {
 		ids = append(ids, singleMatch[1])
+	}
+
+	// Extract pagination from root args — supports:
+	//   (pagination: {number: 1, size: 20}) — Elide style
+	//   (first: 20, offset: 0) — Relay style
+	//   (sort: "name")
+	if idx := strings.Index(inner, "("); idx >= 0 {
+		argsEnd := strings.Index(inner[idx:], ")")
+		if argsEnd > 0 {
+			args := inner[idx : idx+argsEnd+1]
+			// sort
+			page.sort = parseSortArg(args)
+			// Elide pagination: number + size
+			if m := pageRe.FindStringSubmatch(args); len(m) >= 3 {
+				page.number, _ = strconv.Atoi(m[1])
+				page.size, _ = strconv.Atoi(m[2])
+			} else if m := pageRe2.FindStringSubmatch(args); len(m) >= 3 {
+				page.size, _ = strconv.Atoi(m[1])
+				page.number, _ = strconv.Atoi(m[2])
+			} else {
+				// first/offset style
+				if m := firstRe.FindStringSubmatch(args); len(m) >= 2 {
+					page.size, _ = strconv.Atoi(m[1])
+				}
+				if m := offsetRe.FindStringSubmatch(args); len(m) >= 2 {
+					offset, _ := strconv.Atoi(m[1])
+					if page.size > 0 {
+						page.number = offset/page.size + 1
+					}
+				}
+			}
+		}
 	}
 
 	// Find the root node's body using brace matching
