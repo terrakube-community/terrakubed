@@ -270,19 +270,25 @@ func (h *WebhookHandler) triggerJob(ctx context.Context, workspaceID, pushBranch
 		wsBranch         string
 		locked           bool
 		templateRef      string
-		defaultTemplate  string
 		terraformVersion string
 	)
 	err := h.pool.QueryRow(ctx, `
 		SELECT w.organization_id::text, COALESCE(w.branch,''), w.locked,
-		       COALESCE(w.default_template,''), COALESCE(o.default_template,''),
-		       COALESCE(w.terraform_version,'')
+		       COALESCE(w.default_template,''), COALESCE(w.terraform_version,'')
 		FROM workspace w
-		JOIN organization o ON w.organization_id = o.id
 		WHERE w.id = $1 AND w.deleted = false
-	`, workspaceID).Scan(&orgID, &wsBranch, &locked, &templateRef, &defaultTemplate, &terraformVersion)
+	`, workspaceID).Scan(&orgID, &wsBranch, &locked, &templateRef, &terraformVersion)
 	if err != nil {
 		return fmt.Errorf("workspace %s not found: %w", workspaceID, err)
+	}
+
+	// Try org-level default template as fallback (column may not exist in all deployments)
+	var defaultTemplate string
+	if templateRef == "" {
+		_ = h.pool.QueryRow(ctx,
+			`SELECT COALESCE(default_template,'') FROM organization WHERE id = $1`,
+			orgID,
+		).Scan(&defaultTemplate)
 	}
 
 	// Only trigger if the push branch matches the workspace branch

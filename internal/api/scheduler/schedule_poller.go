@@ -110,18 +110,25 @@ func (p *SchedulePoller) syncSchedules(ctx context.Context) {
 func (p *SchedulePoller) triggerScheduledJob(ctx context.Context, workspaceID, scheduleID string) {
 	log.Printf("SchedulePoller: firing schedule %s for workspace %s", scheduleID, workspaceID)
 
-	var orgID, templateRef, defaultTemplate string
+	var orgID, templateRef string
 	var locked bool
 	err := p.pool.QueryRow(ctx, `
-		SELECT w.organization_id::text, COALESCE(w.default_template,''),
-		       COALESCE(o.default_template,''), w.locked
+		SELECT w.organization_id::text, COALESCE(w.default_template,''), w.locked
 		FROM workspace w
-		JOIN organization o ON w.organization_id = o.id
 		WHERE w.id = $1 AND w.deleted = false
-	`, workspaceID).Scan(&orgID, &templateRef, &defaultTemplate, &locked)
+	`, workspaceID).Scan(&orgID, &templateRef, &locked)
 	if err != nil {
 		log.Printf("SchedulePoller: workspace %s not found: %v", workspaceID, err)
 		return
+	}
+
+	// Try to get org-level default template as fallback (column may not exist in all deployments)
+	var defaultTemplate string
+	if templateRef == "" {
+		_ = p.pool.QueryRow(ctx,
+			`SELECT COALESCE(default_template,'') FROM organization WHERE id = $1`,
+			orgID,
+		).Scan(&defaultTemplate)
 	}
 
 	if locked {

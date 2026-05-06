@@ -119,12 +119,14 @@ type AuditFields struct {
 
 // Organization — table "organization"
 type Organization struct {
-	ID            uuid.UUID     `json:"id"            db:"id"`
-	Name          string        `json:"name"          db:"name"`
-	Description   string        `json:"description"   db:"description"`
-	Disabled      bool          `json:"disabled"      db:"disabled"`
-	ExecutionMode ExecutionMode `json:"executionMode" db:"execution_mode"`
-	Icon          string        `json:"icon"          db:"icon"`
+	AuditFields
+	ID              uuid.UUID     `json:"id"              db:"id"`
+	Name            string        `json:"name"            db:"name"`
+	Description     string        `json:"description"     db:"description"`
+	Disabled        bool          `json:"disabled"        db:"disabled"`
+	ExecutionMode   ExecutionMode `json:"executionMode"   db:"execution_mode"`
+	Icon            string        `json:"icon"            db:"icon"`
+	DefaultTemplate string        `json:"defaultTemplate" db:"default_template"`
 }
 
 // Workspace — table "workspace"
