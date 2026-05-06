@@ -100,12 +100,12 @@ func (h *GraphQLHandler) executeQuery(r *http.Request, query string, variables m
 	// Parse the root resource type from the query
 	// Pattern: { resourceType { edges { node { field1 field2 } } } }
 	// or: { resourceType(ids: ["..."]) { edges { node { field1 field2 } } } }
-	rootType, ids, fields, relationships, pageParams := parseGraphQLQuery(query)
+	rootType, ids, fields, relationships, pageParams, filterExpr := parseGraphQLQuery(query)
 	if rootType == "" {
 		return nil, fmt.Errorf("could not parse query")
 	}
 
-	log.Printf("GraphQL: type=%s ids=%v fields=%v rels=%v page=%+v", rootType, ids, fields, relationships, pageParams)
+	log.Printf("GraphQL: type=%s ids=%v fields=%v rels=%v page=%+v filter=%q", rootType, ids, fields, relationships, pageParams, filterExpr)
 
 	// Check if the resource type is registered
 	meta, ok := h.repo.GetMeta(rootType)
@@ -113,14 +113,17 @@ func (h *GraphQLHandler) executeQuery(r *http.Request, query string, variables m
 		return nil, fmt.Errorf("unknown resource type: %s", rootType)
 	}
 
+	// Resolve Elide filter expression to repository filter map using the meta
+	filters := parseElideFilter(filterExpr, meta)
+
 	// Build the result
 	if len(ids) > 0 {
 		// Fetch specific records by ID
 		return h.fetchByIDs(ctx, rootType, meta, ids, fields, relationships)
 	}
 
-	// List all records (with optional pagination)
-	return h.fetchAll(ctx, rootType, meta, fields, relationships, pageParams)
+	// List all records (with optional pagination/filtering)
+	return h.fetchAll(ctx, rootType, meta, fields, relationships, pageParams, filters)
 }
 
 func (h *GraphQLHandler) fetchByIDs(ctx context.Context, resourceType string, meta *repository.ResourceMeta, ids []string, fields []string, relationships []relInfo) (interface{}, error) {
@@ -153,7 +156,7 @@ func (h *GraphQLHandler) fetchByIDs(ctx context.Context, resourceType string, me
 	}, nil
 }
 
-func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta *repository.ResourceMeta, fields []string, relationships []relInfo, page gqlPage) (interface{}, error) {
+func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta *repository.ResourceMeta, fields []string, relationships []relInfo, page gqlPage, filters map[string]interface{}) (interface{}, error) {
 	params := repository.ListParams{}
 	if page.sort != "" {
 		params.Sort = page.sort
@@ -163,6 +166,9 @@ func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta
 		if page.number > 1 {
 			params.PageOffset = (page.number - 1) * page.size
 		}
+	}
+	if len(filters) > 0 {
+		params.Filters = filters
 	}
 	rows, err := h.repo.List(ctx, resourceType, params)
 	if err != nil {
@@ -355,6 +361,119 @@ func (h *GraphQLHandler) executeMutation(r *http.Request, query string, variable
 	}
 }
 
+// parseInlineData parses a GraphQL inline data body (content inside the outer braces)
+// and populates the data map. Handles strings, booleans, numbers, and null.
+//
+// Supports:
+//
+//	key: "string value"
+//	key: 'string value'
+//	key: true / false
+//	key: null
+//	key: 123 / 1.5
+func parseInlineData(body string, data map[string]interface{}) {
+	body = strings.TrimSpace(body)
+	i := 0
+	for i < len(body) {
+		// Skip whitespace and commas
+		for i < len(body) && (body[i] == ' ' || body[i] == '\t' || body[i] == '\n' || body[i] == '\r' || body[i] == ',') {
+			i++
+		}
+		if i >= len(body) {
+			break
+		}
+
+		// Read key
+		keyStart := i
+		for i < len(body) && isWordChar(body[i]) {
+			i++
+		}
+		if keyStart == i {
+			i++ // skip unexpected char
+			continue
+		}
+		key := body[keyStart:i]
+
+		// Skip whitespace
+		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+			i++
+		}
+		// Expect ':'
+		if i >= len(body) || body[i] != ':' {
+			continue
+		}
+		i++ // skip ':'
+
+		// Skip whitespace
+		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+			i++
+		}
+		if i >= len(body) {
+			break
+		}
+
+		// Parse value
+		switch body[i] {
+		case '"', '\'':
+			// String value
+			quote := body[i]
+			i++
+			valStart := i
+			for i < len(body) && body[i] != quote {
+				if body[i] == '\\' {
+					i++ // skip escaped char
+				}
+				i++
+			}
+			data[key] = body[valStart:i]
+			if i < len(body) {
+				i++ // skip closing quote
+			}
+
+		case '{':
+			// Nested object — skip for now (advance past the block)
+			depth := 0
+			for i < len(body) {
+				if body[i] == '{' {
+					depth++
+				} else if body[i] == '}' {
+					depth--
+					if depth == 0 {
+						i++
+						break
+					}
+				}
+				i++
+			}
+
+		default:
+			// Boolean, number, or null
+			valStart := i
+			for i < len(body) && body[i] != ',' && body[i] != '\n' && body[i] != '}' {
+				i++
+			}
+			raw := strings.TrimSpace(body[valStart:i])
+			switch raw {
+			case "true":
+				data[key] = true
+			case "false":
+				data[key] = false
+			case "null":
+				data[key] = nil
+			default:
+				// Try integer then float
+				if iv, err := strconv.ParseInt(raw, 10, 64); err == nil {
+					data[key] = iv
+				} else if fv, err := strconv.ParseFloat(raw, 64); err == nil {
+					data[key] = fv
+				} else {
+					data[key] = raw // fallback: keep as string
+				}
+			}
+		}
+	}
+}
+
 // ──────────────────────────────────────────────────
 // Query parsing helpers — proper brace-matching
 // ──────────────────────────────────────────────────
@@ -388,7 +507,7 @@ var (
 	offsetRe = regexp.MustCompile(`offset\s*:\s*(\d+)`)
 )
 
-func parseGraphQLQuery(query string) (rootType string, ids []string, fields []string, relationships []relInfo, page gqlPage) {
+func parseGraphQLQuery(query string) (rootType string, ids []string, fields []string, relationships []relInfo, page gqlPage, filterExpr string) {
 	// Extract root type
 	matches := rootTypeRe.FindStringSubmatch(query)
 	if len(matches) < 2 {
@@ -414,33 +533,35 @@ func parseGraphQLQuery(query string) (rootType string, ids []string, fields []st
 		ids = append(ids, singleMatch[1])
 	}
 
-	// Extract pagination from root args — supports:
-	//   (pagination: {number: 1, size: 20}) — Elide style
-	//   (first: 20, offset: 0) — Relay style
-	//   (sort: "name")
+	// Extract root args (between the first pair of parens after root type)
+	var rootArgs string
 	if idx := strings.Index(inner, "("); idx >= 0 {
-		argsEnd := strings.Index(inner[idx:], ")")
-		if argsEnd > 0 {
-			args := inner[idx : idx+argsEnd+1]
-			// sort
-			page.sort = parseSortArg(args)
-			// Elide pagination: number + size
-			if m := pageRe.FindStringSubmatch(args); len(m) >= 3 {
-				page.number, _ = strconv.Atoi(m[1])
-				page.size, _ = strconv.Atoi(m[2])
-			} else if m := pageRe2.FindStringSubmatch(args); len(m) >= 3 {
+		rootArgs = extractParenContent(inner, idx)
+	}
+
+	if rootArgs != "" {
+		// sort
+		page.sort = parseSortArg(rootArgs)
+
+		// Elide filter: filter: "expression"
+		filterExpr = parseFilterArg(rootArgs)
+
+		// Elide pagination: (pagination: {number: 1, size: 20})
+		if m := pageRe.FindStringSubmatch(rootArgs); len(m) >= 3 {
+			page.number, _ = strconv.Atoi(m[1])
+			page.size, _ = strconv.Atoi(m[2])
+		} else if m := pageRe2.FindStringSubmatch(rootArgs); len(m) >= 3 {
+			page.size, _ = strconv.Atoi(m[1])
+			page.number, _ = strconv.Atoi(m[2])
+		} else {
+			// first/offset style
+			if m := firstRe.FindStringSubmatch(rootArgs); len(m) >= 2 {
 				page.size, _ = strconv.Atoi(m[1])
-				page.number, _ = strconv.Atoi(m[2])
-			} else {
-				// first/offset style
-				if m := firstRe.FindStringSubmatch(args); len(m) >= 2 {
-					page.size, _ = strconv.Atoi(m[1])
-				}
-				if m := offsetRe.FindStringSubmatch(args); len(m) >= 2 {
-					offset, _ := strconv.Atoi(m[1])
-					if page.size > 0 {
-						page.number = offset/page.size + 1
-					}
+			}
+			if m := offsetRe.FindStringSubmatch(rootArgs); len(m) >= 2 {
+				offset, _ := strconv.Atoi(m[1])
+				if page.size > 0 {
+					page.number = offset/page.size + 1
 				}
 			}
 		}
@@ -456,6 +577,73 @@ func parseGraphQLQuery(query string) (rootType string, ids []string, fields []st
 	// Parse the node body into fields and relationships
 	fields, relationships = parseNodeBody(nodeBody)
 	return
+}
+
+// parseFilterArg extracts the value of a filter: "..." argument from GraphQL args.
+func parseFilterArg(args string) string {
+	filterRe := regexp.MustCompile(`filter\s*:\s*"([^"]*)"`)
+	m := filterRe.FindStringSubmatch(args)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	// Also match single-quoted filter
+	filterRe2 := regexp.MustCompile(`filter\s*:\s*'([^']*)'`)
+	m = filterRe2.FindStringSubmatch(args)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// parseElideFilter parses an Elide RSQL filter expression into a repository filter map.
+// Supported patterns:
+//   - "field=='value'"           → Filters["field"] = "value"
+//   - "parentType.id=='uuid'"    → Filters[fk_column] = "uuid"  (resolved via meta.Parents)
+//   - Multiple with ';' or ','   → AND-combined (all conditions applied)
+func parseElideFilter(expr string, meta *repository.ResourceMeta) map[string]interface{} {
+	if expr == "" || meta == nil {
+		return nil
+	}
+
+	// Split on ';' or ',' (Elide uses ';' for AND, ',' for OR — we only support AND)
+	conditions := regexp.MustCompile(`[;,]`).Split(expr, -1)
+	filters := make(map[string]interface{})
+
+	// Pattern: field==['value'] or field=='value'
+	eqRe := regexp.MustCompile(`^([a-zA-Z0-9_.]+)==\[?'?([^'\]]*)'?\]?$`)
+
+	for _, cond := range conditions {
+		cond = strings.TrimSpace(cond)
+		m := eqRe.FindStringSubmatch(cond)
+		if len(m) < 3 {
+			continue
+		}
+		field, value := m[1], m[2]
+
+		// Handle "parentType.attribute" → look up FK column in Parents
+		if dot := strings.Index(field, "."); dot >= 0 {
+			parentTypeName := field[:dot]
+			// attribute := field[dot+1:] // e.g. "id" — we use the FK column regardless
+
+			// Find the FK column for this parent type
+			for _, parent := range meta.Parents {
+				if parent.ParentType == parentTypeName {
+					filters[parent.FKColumn] = value
+					break
+				}
+			}
+			continue
+		}
+
+		// Simple field equality — convert camelCase to snake_case
+		col := camelToSnake(field)
+		filters[col] = value
+	}
+
+	if len(filters) == 0 {
+		return nil
+	}
+	return filters
 }
 
 // findNodeBody finds the content inside the first `node { ... }` with proper brace matching.
@@ -649,12 +837,14 @@ func parseMutation(query string, variables map[string]interface{}) (rootType str
 		}
 	}
 
-	// Try to extract inline data: data: { key: "value" ... }
-	dataMatch := regexp.MustCompile(`data\s*:\s*\{([^}]+)\}`).FindStringSubmatch(query)
-	if len(dataMatch) >= 2 {
-		pairs := regexp.MustCompile(`(\w+)\s*:\s*"([^"]*)"`).FindAllStringSubmatch(dataMatch[1], -1)
-		for _, p := range pairs {
-			data[p[1]] = p[2]
+	// Try to extract inline data block: data: { ... } (using brace matching)
+	if dataIdx := strings.Index(query, "data:"); dataIdx >= 0 {
+		afterData := strings.TrimSpace(query[dataIdx+5:])
+		if braceIdx := strings.Index(afterData, "{"); braceIdx >= 0 {
+			dataBody := extractBraceContent(afterData, braceIdx)
+			if dataBody != "" {
+				parseInlineData(dataBody, data)
+			}
 		}
 	}
 
