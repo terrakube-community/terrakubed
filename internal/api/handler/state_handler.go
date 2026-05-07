@@ -146,14 +146,27 @@ func (h *TerraformStateHandler) uploadHostedState(w http.ResponseWriter, r *http
 
 // RemoteTFEHandler handles TFE-compatible API endpoints.
 type RemoteTFEHandler struct {
-	pool     *pgxpool.Pool
-	hostname string
-	storage  storage.StorageService
+	pool      *pgxpool.Pool
+	hostname  string
+	storage   storage.StorageService
+	logReader logReader
+}
+
+// logReader is a small interface so RemoteTFEHandler can use the streaming.LogStreamReader
+// without importing the streaming package (avoiding a circular dependency risk).
+type logReader interface {
+	GetStepOutput(ctx context.Context, orgID, jobID, stepID string) ([]byte, error)
 }
 
 // NewRemoteTFEHandler creates a new handler.
 func NewRemoteTFEHandler(pool *pgxpool.Pool, hostname string, storageSvc storage.StorageService) *RemoteTFEHandler {
 	return &RemoteTFEHandler{pool: pool, hostname: hostname, storage: storageSvc}
+}
+
+// WithLogReader wires an optional log stream reader (Redis → storage fallback).
+func (h *RemoteTFEHandler) WithLogReader(lr logReader) *RemoteTFEHandler {
+	h.logReader = lr
+	return h
 }
 
 // ServeHTTP routes /remote/tfe/v2/ requests.
@@ -725,7 +738,7 @@ func (h *RemoteTFEHandler) writePlanDoc(w http.ResponseWriter, ctx context.Conte
 	json.NewEncoder(w).Encode(doc)
 }
 
-// getPlanLog serves the plan step log — tries Redis then storage.
+// getPlanLog serves the plan step log — tries Redis (live) then storage (completed).
 func (h *RemoteTFEHandler) getPlanLog(w http.ResponseWriter, r *http.Request, jobID int) {
 	// Get plan step details
 	var stepID, orgID, wsID string
@@ -739,6 +752,16 @@ func (h *RemoteTFEHandler) getPlanLog(w http.ResponseWriter, r *http.Request, jo
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		return
+	}
+
+	// Try Redis stream first (live log from running executor)
+	if h.logReader != nil {
+		if data, err := h.logReader.GetStepOutput(r.Context(), orgID, fmt.Sprintf("%d", jobID), stepID); err == nil && len(data) > 0 {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			w.Write(data)
+			return
+		}
 	}
 
 	// Try storage path: tfoutput/{orgId}/{jobId}/{stepId}.tfoutput
@@ -909,7 +932,7 @@ func (h *RemoteTFEHandler) writeApplyDoc(w http.ResponseWriter, ctx context.Cont
 	json.NewEncoder(w).Encode(doc)
 }
 
-// getApplyLog serves the apply step log from Redis or storage.
+// getApplyLog serves the apply step log from Redis (live) or storage (completed).
 func (h *RemoteTFEHandler) getApplyLog(w http.ResponseWriter, r *http.Request, jobID int) {
 	// Find the apply step (step_number > 100, which is after the plan step at 100)
 	var stepID, orgID, wsID string
@@ -926,12 +949,28 @@ func (h *RemoteTFEHandler) getApplyLog(w http.ResponseWriter, r *http.Request, j
 		return
 	}
 
+	// Try Redis stream first (live log from running executor)
+	if h.logReader != nil {
+		if data, err := h.logReader.GetStepOutput(r.Context(), orgID, fmt.Sprintf("%d", jobID), stepID); err == nil && len(data) > 0 {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			w.Write(data)
+			return
+		}
+	}
+
+	// Fall back to storage path used by Java executor: tfplan/{jobId}/terraformapply/{stepId}.txt
 	remotePath := fmt.Sprintf("tfplan/%d/terraformapply/%s.txt", jobID, stepID)
 	reader, err := h.storage.DownloadFile(remotePath)
 	if err != nil {
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusOK)
-		return
+		// Also try the standard tfoutput path used by the Go executor
+		altPath := fmt.Sprintf("tfoutput/%s/%d/%s.tfoutput", orgID, jobID, stepID)
+		reader, err = h.storage.DownloadFile(altPath)
+		if err != nil {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 	}
 	defer reader.Close()
 
