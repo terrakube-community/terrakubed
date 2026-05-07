@@ -58,6 +58,7 @@ func RegisterAll(repo *repository.GenericRepository) {
 			"workspaceTag": {ChildType: "workspacetag", FKColumn: "workspace_id"},
 			"access":       {ChildType: "access", FKColumn: "workspace_id"},
 			"reference":    {ChildType: "reference", FKColumn: "workspace_id"},
+			"webhook":      {ChildType: "webhook", FKColumn: "workspace_id"},
 		},
 	})
 
@@ -244,7 +245,9 @@ func RegisterAll(repo *repository.GenericRepository) {
 		Parents: map[string]repository.ParentRelation{
 			"workspace": {FKColumn: "workspace_id", ParentType: "workspace"},
 		},
-		Children: map[string]repository.ChildRelation{},
+		Children:             map[string]repository.ChildRelation{},
+		SensitiveFlagColumn:  "sensitive",
+		SensitiveMaskColumns: []string{"variable_value"},
 	})
 
 	repo.Register(&repository.ResourceMeta{
@@ -256,7 +259,9 @@ func RegisterAll(repo *repository.GenericRepository) {
 		Parents: map[string]repository.ParentRelation{
 			"organization": {FKColumn: "organization_id", ParentType: "organization"},
 		},
-		Children: map[string]repository.ChildRelation{},
+		Children:             map[string]repository.ChildRelation{},
+		SensitiveFlagColumn:  "sensitive",
+		SensitiveMaskColumns: []string{"variable_value"},
 	})
 
 	// ── Workspace sub-entities ─────────────────────

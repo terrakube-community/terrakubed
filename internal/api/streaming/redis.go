@@ -2,6 +2,7 @@ package streaming
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -50,28 +51,101 @@ func (r *LogStreamReader) GetStepOutput(ctx context.Context, orgID, jobID, stepI
 }
 
 // readFromRedis reads all entries from a Redis Stream and returns concatenated log output.
-// Matches the Java LogsConsumer / StreamingService.getCurrentLogs() pattern.
+// The Go executor uses JDK-serialized keys and field names (for Java API compat), so we
+// try both the plain key and the JDK-serialized key, and decode field values accordingly.
 func (r *LogStreamReader) readFromRedis(ctx context.Context, jobID string) ([]byte, error) {
+	// Try plain key first (simple clients, future Go-native executors)
 	msgs, err := r.redis.XRange(ctx, jobID, "-", "+").Result()
-	if err != nil {
-		return nil, fmt.Errorf("XRange %s: %w", jobID, err)
+	if err != nil || len(msgs) == 0 {
+		// Try JDK-serialized key (current Go executor compatibility path)
+		jdkKey := jdkSerialize(jobID)
+		msgs2, err2 := r.redis.XRange(ctx, jdkKey, "-", "+").Result()
+		if err2 != nil {
+			if err != nil {
+				return nil, fmt.Errorf("XRange plain key: %v; JDK key: %v", err, err2)
+			}
+			return nil, fmt.Errorf("stream %s is empty or does not exist", jobID)
+		}
+		msgs = msgs2
 	}
+
 	if len(msgs) == 0 {
-		return nil, fmt.Errorf("stream %s is empty or does not exist", jobID)
+		return nil, fmt.Errorf("stream %s is empty", jobID)
 	}
 
 	var sb strings.Builder
 	for _, msg := range msgs {
-		// Skip sentinel done messages
-		if _, done := msg.Values["done"]; done {
+		// Field names are JDK-serialized — check both serialized and plain forms
+		isDone := false
+		for k := range msg.Values {
+			plain := jdkDeserialize(k)
+			if plain == "done" {
+				isDone = true
+				break
+			}
+		}
+		if isDone {
 			continue
 		}
-		if out, ok := msg.Values["output"]; ok {
-			sb.WriteString(fmt.Sprintf("%v", out))
-			sb.WriteByte('\n')
+
+		for k, v := range msg.Values {
+			fieldName := jdkDeserialize(k)
+			if fieldName == "output" {
+				raw := fmt.Sprintf("%v", v)
+				sb.WriteString(jdkDeserialize(raw))
+				sb.WriteByte('\n')
+				break
+			}
 		}
 	}
 	return []byte(sb.String()), nil
+}
+
+// ──────────────────────────────────────────────────
+// JDK serialization helpers (mirrors executor/logs/redis.go)
+// ──────────────────────────────────────────────────
+
+// JDKSerialize encodes a string using Java's JdkSerializationRedisSerializer format.
+// Exported so the LogsHandler can write compatible keys/values when writing to Redis.
+// Format: 0xAC 0xED 0x00 0x05 0x74 {2-byte-BE-len} {utf8-bytes}
+func JDKSerialize(s string) string {
+	return jdkSerialize(s)
+}
+
+// jdkSerialize encodes a string using Java's JdkSerializationRedisSerializer format.
+// Format: 0xAC 0xED 0x00 0x05 0x74 {2-byte-BE-len} {utf8-bytes}
+func jdkSerialize(s string) string {
+	b := []byte(s)
+	n := len(b)
+	buf := make([]byte, 7+n)
+	buf[0] = 0xAC
+	buf[1] = 0xED
+	buf[2] = 0x00
+	buf[3] = 0x05
+	buf[4] = 0x74
+	buf[5] = byte(n >> 8)
+	buf[6] = byte(n)
+	copy(buf[7:], b)
+	return string(buf)
+}
+
+// jdkDeserialize decodes a JDK-serialized string.
+// Returns the input unchanged if it does not match the JDK magic bytes.
+func jdkDeserialize(s string) string {
+	b := []byte(s)
+	// Minimum: 7 bytes header
+	if len(b) < 7 {
+		return s
+	}
+	// Check magic: AC ED 00 05 74
+	if b[0] != 0xAC || b[1] != 0xED || b[2] != 0x00 || b[3] != 0x05 || b[4] != 0x74 {
+		return s
+	}
+	strLen := int(binary.BigEndian.Uint16(b[5:7]))
+	if len(b) < 7+strLen {
+		return s
+	}
+	return string(b[7 : 7+strLen])
 }
 
 // readFromStorage downloads the log file from object storage.

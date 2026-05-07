@@ -15,6 +15,7 @@ import (
 type StatusService interface {
 	SetRunning(job *model.TerraformJob) error
 	SetCompleted(job *model.TerraformJob, success bool, output string) error
+	SetNoChanges(job *model.TerraformJob, output string) error
 	SetPending(job *model.TerraformJob, output string) error
 	SetApprovalCompleted(job *model.TerraformJob, output string) error
 	UpdateCommitId(job *model.TerraformJob, commitId string) error
@@ -67,6 +68,18 @@ func (s *Service) SetCompleted(job *model.TerraformJob, success bool, output str
 		return fmt.Errorf("failed to update step status: %w", err)
 	}
 	return s.client.UpdateJobStatus(job.OrganizationId, job.JobId, status, "")
+}
+
+// SetNoChanges marks a plan step as completed and the job as "noChanges"
+// (plan ran but detected no infrastructure drift). Distinct from "completed"
+// so the UI can show "No Changes" and auto-apply skips the apply step.
+func (s *Service) SetNoChanges(job *model.TerraformJob, output string) error {
+	outputPath := s.saveOutput(job.OrganizationId, job.JobId, job.StepId, output)
+
+	if err := s.client.UpdateStepStatus(job.OrganizationId, job.JobId, job.StepId, "completed", outputPath); err != nil {
+		return fmt.Errorf("failed to update step status: %w", err)
+	}
+	return s.client.UpdateJobStatus(job.OrganizationId, job.JobId, "noChanges", "")
 }
 
 func (s *Service) SetPending(job *model.TerraformJob, output string) error {

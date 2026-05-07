@@ -100,8 +100,6 @@ var publicPaths = []string{
 }
 
 var publicPrefixPaths = []string{
-	"/remote/tfe/v2/plans/logs/",
-	"/remote/tfe/v2/applies/logs/",
 	"/tofu/index.json",
 }
 
@@ -119,6 +117,17 @@ func isPublicPath(path string, method string) bool {
 
 	for _, p := range publicPrefixPaths {
 		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+
+	// Terraform CLI fetches plan/apply logs without an auth header.
+	// Paths follow the pattern /{resource}/{id}/log(s) — match only GET requests.
+	if method == http.MethodGet {
+		if strings.HasPrefix(path, "/remote/tfe/v2/plans/") && strings.HasSuffix(path, "/log") {
+			return true
+		}
+		if strings.HasPrefix(path, "/remote/tfe/v2/applies/") && strings.HasSuffix(path, "/logs") {
 			return true
 		}
 	}
@@ -148,17 +157,22 @@ func AuthMiddleware(config AuthConfig) func(http.Handler) http.Handler {
 				return
 			}
 
-			// Extract Bearer token
-			authHeader := r.Header.Get("Authorization")
-			if authHeader == "" {
-				http.Error(w, `{"errors":[{"status":"401","title":"Unauthorized","detail":"Missing Authorization header"}]}`, http.StatusUnauthorized)
-				return
-			}
-
-			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if token == authHeader {
-				http.Error(w, `{"errors":[{"status":"401","title":"Unauthorized","detail":"Invalid Authorization header format"}]}`, http.StatusUnauthorized)
-				return
+			// Extract Bearer token — accept both Authorization: Bearer <t> and X-TFC-Token: <t>
+			// The Terraform CLI uses X-TFC-Token when talking to the TFE remote backend.
+			token := ""
+			if tfcToken := r.Header.Get("X-TFC-Token"); tfcToken != "" {
+				token = tfcToken
+			} else {
+				authHeader := r.Header.Get("Authorization")
+				if authHeader == "" {
+					http.Error(w, `{"errors":[{"status":"401","title":"Unauthorized","detail":"Missing Authorization header"}]}`, http.StatusUnauthorized)
+					return
+				}
+				token = strings.TrimPrefix(authHeader, "Bearer ")
+				if token == authHeader {
+					http.Error(w, `{"errors":[{"status":"401","title":"Unauthorized","detail":"Invalid Authorization header format"}]}`, http.StatusUnauthorized)
+					return
+				}
 			}
 
 			// Decode JWT claims (without signature verification first to determine issuer)
@@ -186,12 +200,10 @@ func AuthMiddleware(config AuthConfig) func(http.Handler) http.Handler {
 					return
 				}
 			default:
-				// Dex/OIDC token — verify with OIDC provider
-				// For now, we trust the JWT format and validate expiry.
-				// Full OIDC verification (JWK validation) will be added when
-				// we integrate with the OIDC discovery endpoint.
-				if claims.Expiry > 0 && time.Now().Unix() > claims.Expiry {
-					http.Error(w, `{"errors":[{"status":"401","title":"Unauthorized","detail":"Token expired"}]}`, http.StatusUnauthorized)
+				// Dex/OIDC token — verify signature with JWKS from issuer
+				if err := verifyOIDCToken(token, config.DexIssuerURI); err != nil {
+					log.Printf("OIDC token verification failed: %v", err)
+					http.Error(w, `{"errors":[{"status":"401","title":"Unauthorized","detail":"Invalid OIDC token"}]}`, http.StatusUnauthorized)
 					return
 				}
 			}
@@ -267,18 +279,25 @@ func decodeJWTClaims(token string) (*UserInfo, error) {
 		return nil, fmt.Errorf("failed to decode JWT payload: %w", err)
 	}
 
+	// Decode into raw map first to handle groups as []interface{} robustly
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return nil, fmt.Errorf("failed to parse JWT claims: %w", err)
+	}
+
 	var claims UserInfo
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return nil, fmt.Errorf("failed to parse JWT claims: %w", err)
 	}
 
-	// Parse groups from different claim formats
-	var raw map[string]interface{}
-	json.Unmarshal(payload, &raw)
-	if groups, ok := raw["groups"]; ok {
-		switch g := groups.(type) {
-		case []interface{}:
-			for _, v := range g {
+	// Re-parse groups from raw to handle heterogeneous arrays ([]interface{}).
+	// json.Unmarshal into []string fails silently if the JSON array contains
+	// non-string elements, so we do it explicitly and replace any result.
+	if raw["groups"] != nil {
+		var groupsRaw []interface{}
+		if json.Unmarshal(raw["groups"], &groupsRaw) == nil {
+			claims.Groups = nil // reset to avoid duplicates if []string already worked
+			for _, v := range groupsRaw {
 				if s, ok := v.(string); ok {
 					claims.Groups = append(claims.Groups, s)
 				}

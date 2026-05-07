@@ -8,8 +8,11 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
+	"github.com/terrakube-community/terrakubed/internal/api/middleware"
 	"github.com/terrakube-community/terrakubed/internal/api/repository"
 )
 
@@ -70,7 +73,7 @@ func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("GraphQL query: %s", truncate(req.Query, 500))
 
-	result, err := h.executeQuery(r.Context(), req.Query, req.Variables)
+	result, err := h.executeQuery(r, req.Query, req.Variables)
 	if err != nil {
 		log.Printf("GraphQL error: %v", err)
 		writeGQLError(w, err.Error())
@@ -85,23 +88,24 @@ func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // executeQuery parses an Elide-style GraphQL query and executes it.
-func (h *GraphQLHandler) executeQuery(ctx context.Context, query string, variables map[string]interface{}) (interface{}, error) {
+func (h *GraphQLHandler) executeQuery(r *http.Request, query string, variables map[string]interface{}) (interface{}, error) {
+	ctx := r.Context()
 	query = strings.TrimSpace(query)
 
 	// Determine if it's a query or mutation
 	if strings.HasPrefix(query, "mutation") {
-		return h.executeMutation(ctx, query, variables)
+		return h.executeMutation(r, query, variables)
 	}
 
 	// Parse the root resource type from the query
 	// Pattern: { resourceType { edges { node { field1 field2 } } } }
 	// or: { resourceType(ids: ["..."]) { edges { node { field1 field2 } } } }
-	rootType, ids, fields, relationships := parseGraphQLQuery(query)
+	rootType, ids, fields, relationships, pageParams, filterExpr := parseGraphQLQuery(query)
 	if rootType == "" {
 		return nil, fmt.Errorf("could not parse query")
 	}
 
-	log.Printf("GraphQL: type=%s ids=%v fields=%v rels=%v", rootType, ids, fields, relationships)
+	log.Printf("GraphQL: type=%s ids=%v fields=%v rels=%v page=%+v filter=%q", rootType, ids, fields, relationships, pageParams, filterExpr)
 
 	// Check if the resource type is registered
 	meta, ok := h.repo.GetMeta(rootType)
@@ -109,14 +113,17 @@ func (h *GraphQLHandler) executeQuery(ctx context.Context, query string, variabl
 		return nil, fmt.Errorf("unknown resource type: %s", rootType)
 	}
 
+	// Resolve Elide filter expression to repository filter map using the meta
+	filters := parseElideFilter(filterExpr, meta)
+
 	// Build the result
 	if len(ids) > 0 {
 		// Fetch specific records by ID
 		return h.fetchByIDs(ctx, rootType, meta, ids, fields, relationships)
 	}
 
-	// List all records
-	return h.fetchAll(ctx, rootType, meta, fields, relationships)
+	// List all records (with optional pagination/filtering)
+	return h.fetchAll(ctx, rootType, meta, fields, relationships, pageParams, filters)
 }
 
 func (h *GraphQLHandler) fetchByIDs(ctx context.Context, resourceType string, meta *repository.ResourceMeta, ids []string, fields []string, relationships []relInfo) (interface{}, error) {
@@ -129,9 +136,9 @@ func (h *GraphQLHandler) fetchByIDs(ctx context.Context, resourceType string, me
 		}
 		node := filterFields(row, fields)
 
-		// Resolve relationships
+		// Resolve relationships, passing the full row for FK access on parent rels
 		for _, rel := range relationships {
-			relData, err := h.resolveRelationship(ctx, id, meta, rel)
+			relData, err := h.resolveRelationship(ctx, id, row, meta, rel)
 			if err != nil {
 				log.Printf("GraphQL: error resolving rel %s for %s/%s: %v", rel.name, resourceType, id, err)
 			} else {
@@ -149,8 +156,21 @@ func (h *GraphQLHandler) fetchByIDs(ctx context.Context, resourceType string, me
 	}, nil
 }
 
-func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta *repository.ResourceMeta, fields []string, relationships []relInfo) (interface{}, error) {
-	rows, err := h.repo.List(ctx, resourceType, repository.ListParams{})
+func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta *repository.ResourceMeta, fields []string, relationships []relInfo, page gqlPage, filters map[string]interface{}) (interface{}, error) {
+	params := repository.ListParams{}
+	if page.sort != "" {
+		params.Sort = page.sort
+	}
+	if page.size > 0 {
+		params.PageSize = page.size
+		if page.number > 1 {
+			params.PageOffset = (page.number - 1) * page.size
+		}
+	}
+	if len(filters) > 0 {
+		params.Filters = filters
+	}
+	rows, err := h.repo.List(ctx, resourceType, params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list %s: %w", resourceType, err)
 	}
@@ -159,10 +179,10 @@ func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta
 	for _, row := range rows {
 		node := filterFields(row, fields)
 
-		// Resolve relationships
+		// Resolve relationships, passing the full row for FK access on parent rels
 		id := fmt.Sprintf("%v", row[meta.PKColumn])
 		for _, rel := range relationships {
-			relData, err := h.resolveRelationship(ctx, id, meta, rel)
+			relData, err := h.resolveRelationship(ctx, id, row, meta, rel)
 			if err != nil {
 				log.Printf("GraphQL: error resolving rel %s for %s/%s: %v", rel.name, resourceType, id, err)
 			} else {
@@ -180,8 +200,37 @@ func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta
 	}, nil
 }
 
-func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID string, parentMeta *repository.ResourceMeta, rel relInfo) (interface{}, error) {
-	// Check if this is a child relationship
+// resolveRelationship resolves a single relationship for a parent resource node.
+// parentRow is the full DB row for the parent (used to read FK values for to-one rels).
+func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID string, parentRow map[string]interface{}, parentMeta *repository.ResourceMeta, rel relInfo) (interface{}, error) {
+	// ── To-one (parent) relationship ──
+	if toOneRel, ok := parentMeta.Parents[rel.name]; ok {
+		fkVal := parentRow[toOneRel.FKColumn]
+		if fkVal == nil {
+			return map[string]interface{}{"edges": wrapEdges([]map[string]interface{}{})}, nil
+		}
+		relMeta, ok := h.repo.GetMeta(toOneRel.ParentType)
+		if !ok {
+			return nil, fmt.Errorf("unknown type: %s", toOneRel.ParentType)
+		}
+		relRow, err := h.repo.FindByID(ctx, toOneRel.ParentType, fkVal)
+		if err != nil || relRow == nil {
+			return map[string]interface{}{"edges": wrapEdges([]map[string]interface{}{})}, nil
+		}
+		node := filterFields(relRow, rel.fields)
+		relID := fmt.Sprintf("%v", relRow[relMeta.PKColumn])
+		for _, subRel := range rel.rels {
+			subData, err := h.resolveRelationship(ctx, relID, relRow, relMeta, subRel)
+			if err == nil {
+				node[subRel.name] = subData
+			}
+		}
+		return map[string]interface{}{
+			"edges": wrapEdges([]map[string]interface{}{node}),
+		}, nil
+	}
+
+	// ── To-many (child) relationship ──
 	childRel, ok := parentMeta.Children[rel.name]
 	if !ok {
 		return nil, fmt.Errorf("unknown relationship: %s", rel.name)
@@ -212,6 +261,7 @@ func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID strin
 		ParentFK: childRel.FKColumn,
 		ParentID: parentID,
 		Columns:  selectCols,
+		Sort:     rel.sort,
 	}
 	rows, err := h.repo.List(ctx, childRel.ChildType, params)
 	if err != nil {
@@ -226,7 +276,7 @@ func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID strin
 		if childMeta != nil {
 			childID := fmt.Sprintf("%v", row[childMeta.PKColumn])
 			for _, subRel := range rel.rels {
-				subData, err := h.resolveRelationship(ctx, childID, childMeta, subRel)
+				subData, err := h.resolveRelationship(ctx, childID, row, childMeta, subRel)
 				if err == nil {
 					node[subRel.name] = subData
 				}
@@ -242,7 +292,8 @@ func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID strin
 }
 
 // executeMutation handles create/update/delete mutations.
-func (h *GraphQLHandler) executeMutation(ctx context.Context, query string, variables map[string]interface{}) (interface{}, error) {
+func (h *GraphQLHandler) executeMutation(r *http.Request, query string, variables map[string]interface{}) (interface{}, error) {
+	ctx := r.Context()
 	// Elide mutations look like:
 	// mutation { organization(op: UPSERT, data: {id: "...", name: "..."}) { edges { node { id name } } } }
 	// mutation { organization(op: DELETE, ids: ["..."]) { edges { node { id } } } }
@@ -258,11 +309,14 @@ func (h *GraphQLHandler) executeMutation(ctx context.Context, query string, vari
 		return nil, fmt.Errorf("unknown resource type: %s", rootType)
 	}
 
+	meta, _ := h.repo.GetMeta(rootType)
+
 	switch strings.ToUpper(op) {
 	case "UPSERT":
 		id, _ := data["id"].(string)
 		if id != "" {
-			// Update
+			// Update — set updated_by / updated_date
+			setGQLAuditUpdate(ctx, data, meta)
 			if err := h.repo.Update(ctx, rootType, id, data); err != nil {
 				return nil, err
 			}
@@ -276,7 +330,8 @@ func (h *GraphQLHandler) executeMutation(ctx context.Context, query string, vari
 				},
 			}, nil
 		}
-		// Create
+		// Create — set created_by / updated_by / created_date / updated_date
+		setGQLAuditCreate(ctx, data, meta)
 		newID, err := h.repo.Create(ctx, rootType, data)
 		if err != nil {
 			return nil, err
@@ -306,26 +361,153 @@ func (h *GraphQLHandler) executeMutation(ctx context.Context, query string, vari
 	}
 }
 
+// parseInlineData parses a GraphQL inline data body (content inside the outer braces)
+// and populates the data map. Handles strings, booleans, numbers, and null.
+//
+// Supports:
+//
+//	key: "string value"
+//	key: 'string value'
+//	key: true / false
+//	key: null
+//	key: 123 / 1.5
+func parseInlineData(body string, data map[string]interface{}) {
+	body = strings.TrimSpace(body)
+	i := 0
+	for i < len(body) {
+		// Skip whitespace and commas
+		for i < len(body) && (body[i] == ' ' || body[i] == '\t' || body[i] == '\n' || body[i] == '\r' || body[i] == ',') {
+			i++
+		}
+		if i >= len(body) {
+			break
+		}
+
+		// Read key
+		keyStart := i
+		for i < len(body) && isWordChar(body[i]) {
+			i++
+		}
+		if keyStart == i {
+			i++ // skip unexpected char
+			continue
+		}
+		key := body[keyStart:i]
+
+		// Skip whitespace
+		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+			i++
+		}
+		// Expect ':'
+		if i >= len(body) || body[i] != ':' {
+			continue
+		}
+		i++ // skip ':'
+
+		// Skip whitespace
+		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+			i++
+		}
+		if i >= len(body) {
+			break
+		}
+
+		// Parse value
+		switch body[i] {
+		case '"', '\'':
+			// String value
+			quote := body[i]
+			i++
+			valStart := i
+			for i < len(body) && body[i] != quote {
+				if body[i] == '\\' {
+					i++ // skip escaped char
+				}
+				i++
+			}
+			data[key] = body[valStart:i]
+			if i < len(body) {
+				i++ // skip closing quote
+			}
+
+		case '{':
+			// Nested object — skip for now (advance past the block)
+			depth := 0
+			for i < len(body) {
+				if body[i] == '{' {
+					depth++
+				} else if body[i] == '}' {
+					depth--
+					if depth == 0 {
+						i++
+						break
+					}
+				}
+				i++
+			}
+
+		default:
+			// Boolean, number, or null
+			valStart := i
+			for i < len(body) && body[i] != ',' && body[i] != '\n' && body[i] != '}' {
+				i++
+			}
+			raw := strings.TrimSpace(body[valStart:i])
+			switch raw {
+			case "true":
+				data[key] = true
+			case "false":
+				data[key] = false
+			case "null":
+				data[key] = nil
+			default:
+				// Try integer then float
+				if iv, err := strconv.ParseInt(raw, 10, 64); err == nil {
+					data[key] = iv
+				} else if fv, err := strconv.ParseFloat(raw, 64); err == nil {
+					data[key] = fv
+				} else {
+					data[key] = raw // fallback: keep as string
+				}
+			}
+		}
+	}
+}
+
 // ──────────────────────────────────────────────────
 // Query parsing helpers — proper brace-matching
 // ──────────────────────────────────────────────────
 
 type relInfo struct {
 	name   string
+	sort   string    // e.g. "name" or "-name" (from sort: "name" arg)
 	fields []string
 	rels   []relInfo // nested relationships
+}
+
+// gqlPage holds optional pagination params parsed from a GraphQL query.
+type gqlPage struct {
+	size   int // 0 = no limit
+	number int // 1-based
+	sort   string
 }
 
 var (
 	// Matches root type: { organization { ... } }
 	rootTypeRe = regexp.MustCompile(`(?:query\s*(?:\w+)?\s*)?[{]\s*(\w+)`)
-	// Matches ids parameter: (ids: ["id1", "id2"])
-	idsRe = regexp.MustCompile(`\(\s*ids?\s*:\s*\[([^\]]*)\]`)
-	// Matches single id filter: (id: "uuid")
-	singleIDRe = regexp.MustCompile(`\(\s*ids?\s*:\s*"([^"]+)"`)
+	// Matches ids parameter: ids: ["id1", "id2"] (anywhere in args)
+	idsRe = regexp.MustCompile(`\bids?\s*:\s*\[([^\]]*)\]`)
+	// Matches single id filter: id: "uuid" (anywhere in args)
+	singleIDRe = regexp.MustCompile(`\bids?\s*:\s*"([^"]+)"`)
+	// Matches pagination: (pagination: {number: N, size: M})
+	pageRe = regexp.MustCompile(`pagination\s*:\s*\{[^}]*number\s*:\s*(\d+)[^}]*size\s*:\s*(\d+)[^}]*\}`)
+	pageRe2 = regexp.MustCompile(`pagination\s*:\s*\{[^}]*size\s*:\s*(\d+)[^}]*number\s*:\s*(\d+)[^}]*\}`)
+	// Matches first/offset: (first: N, offset: M)
+	firstRe  = regexp.MustCompile(`first\s*:\s*(\d+)`)
+	offsetRe = regexp.MustCompile(`offset\s*:\s*(\d+)`)
 )
 
-func parseGraphQLQuery(query string) (rootType string, ids []string, fields []string, relationships []relInfo) {
+func parseGraphQLQuery(query string) (rootType string, ids []string, fields []string, relationships []relInfo, page gqlPage, filterExpr string) {
 	// Extract root type
 	matches := rootTypeRe.FindStringSubmatch(query)
 	if len(matches) < 2 {
@@ -351,6 +533,40 @@ func parseGraphQLQuery(query string) (rootType string, ids []string, fields []st
 		ids = append(ids, singleMatch[1])
 	}
 
+	// Extract root args (between the first pair of parens after root type)
+	var rootArgs string
+	if idx := strings.Index(inner, "("); idx >= 0 {
+		rootArgs = extractParenContent(inner, idx)
+	}
+
+	if rootArgs != "" {
+		// sort
+		page.sort = parseSortArg(rootArgs)
+
+		// Elide filter: filter: "expression"
+		filterExpr = parseFilterArg(rootArgs)
+
+		// Elide pagination: (pagination: {number: 1, size: 20})
+		if m := pageRe.FindStringSubmatch(rootArgs); len(m) >= 3 {
+			page.number, _ = strconv.Atoi(m[1])
+			page.size, _ = strconv.Atoi(m[2])
+		} else if m := pageRe2.FindStringSubmatch(rootArgs); len(m) >= 3 {
+			page.size, _ = strconv.Atoi(m[1])
+			page.number, _ = strconv.Atoi(m[2])
+		} else {
+			// first/offset style
+			if m := firstRe.FindStringSubmatch(rootArgs); len(m) >= 2 {
+				page.size, _ = strconv.Atoi(m[1])
+			}
+			if m := offsetRe.FindStringSubmatch(rootArgs); len(m) >= 2 {
+				offset, _ := strconv.Atoi(m[1])
+				if page.size > 0 {
+					page.number = offset/page.size + 1
+				}
+			}
+		}
+	}
+
 	// Find the root node's body using brace matching
 	// We need to find: edges { node { BODY } }
 	nodeBody := findNodeBody(inner)
@@ -361,6 +577,78 @@ func parseGraphQLQuery(query string) (rootType string, ids []string, fields []st
 	// Parse the node body into fields and relationships
 	fields, relationships = parseNodeBody(nodeBody)
 	return
+}
+
+// parseFilterArg extracts the value of a filter: "..." argument from GraphQL args.
+func parseFilterArg(args string) string {
+	filterRe := regexp.MustCompile(`filter\s*:\s*"([^"]*)"`)
+	m := filterRe.FindStringSubmatch(args)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	// Also match single-quoted filter
+	filterRe2 := regexp.MustCompile(`filter\s*:\s*'([^']*)'`)
+	m = filterRe2.FindStringSubmatch(args)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// parseElideFilter parses an Elide RSQL filter expression into a repository filter map.
+// Supported patterns:
+//   - "field=='value'"           → Filters["field"] = "value"
+//   - "parentType.id=='uuid'"    → Filters[fk_column] = "uuid"  (resolved via meta.Parents)
+//   - Multiple with ';' or ','   → AND-combined (all conditions applied)
+func parseElideFilter(expr string, meta *repository.ResourceMeta) map[string]interface{} {
+	if expr == "" {
+		return nil
+	}
+
+	// Split on ';' or ',' (Elide uses ';' for AND, ',' for OR — we only support AND)
+	conditions := regexp.MustCompile(`[;,]`).Split(expr, -1)
+	filters := make(map[string]interface{})
+
+	// Pattern: field==['value'] or field=='value'
+	eqRe := regexp.MustCompile(`^([a-zA-Z0-9_.]+)==\[?'?([^'\]]*)'?\]?$`)
+
+	for _, cond := range conditions {
+		cond = strings.TrimSpace(cond)
+		m := eqRe.FindStringSubmatch(cond)
+		if len(m) < 3 {
+			continue
+		}
+		field, value := m[1], m[2]
+
+		// Handle "parentType.attribute" → look up FK column in Parents
+		if dot := strings.Index(field, "."); dot >= 0 {
+			parentTypeName := field[:dot]
+			// attribute := field[dot+1:] // e.g. "id" — we use the FK column regardless
+
+			if meta != nil {
+				// Find the FK column for this parent type
+				for _, parent := range meta.Parents {
+					if parent.ParentType == parentTypeName {
+						filters[parent.FKColumn] = value
+						break
+					}
+				}
+			} else {
+				// No meta — fall back to "parentType_id" convention
+				filters[camelToSnake(parentTypeName)+"_id"] = value
+			}
+			continue
+		}
+
+		// Simple field equality — convert camelCase to snake_case
+		col := camelToSnake(field)
+		filters[col] = value
+	}
+
+	if len(filters) == 0 {
+		return nil
+	}
+	return filters
 }
 
 // findNodeBody finds the content inside the first `node { ... }` with proper brace matching.
@@ -386,6 +674,34 @@ func findNodeBody(s string) string {
 		}
 		idx = pos + 4
 	}
+}
+
+// extractParenContent extracts content between matching parens starting at position of '('.
+func extractParenContent(s string, openPos int) string {
+	depth := 0
+	for i := openPos; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return s[openPos+1 : i]
+			}
+		}
+	}
+	return ""
+}
+
+// parseSortArg extracts the value of a sort: "..." argument.
+// Returns empty string if not present.
+func parseSortArg(args string) string {
+	sortRe := regexp.MustCompile(`sort\s*:\s*"([^"]+)"`)
+	m := sortRe.FindStringSubmatch(args)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
 }
 
 // extractBraceContent extracts content between matching braces starting at position of '{'.
@@ -436,8 +752,14 @@ func parseNodeBody(body string) (fields []string, rels []relInfo) {
 			i++
 		}
 
-		// Skip optional arguments: (sort: "name", filter: ...)
+		// Parse optional arguments: (sort: "name", filter: ...)
+		// We capture sort so child relationships can be ordered correctly.
+		var relSort string
 		if i < len(body) && body[i] == '(' {
+			// Extract the args content
+			argsContent := extractParenContent(body, i)
+			relSort = parseSortArg(argsContent)
+			// Advance past the closing paren
 			depth := 0
 			for i < len(body) {
 				if body[i] == '(' {
@@ -481,7 +803,7 @@ func parseNodeBody(body string) (fields []string, rels []relInfo) {
 			relNodeBody := findNodeBody(content)
 			if relNodeBody != "" {
 				relFields, subRels := parseNodeBody(relNodeBody)
-				rels = append(rels, relInfo{name: word, fields: relFields, rels: subRels})
+				rels = append(rels, relInfo{name: word, sort: relSort, fields: relFields, rels: subRels})
 			}
 		} else {
 			// It's a scalar field
@@ -511,21 +833,28 @@ func parseMutation(query string, variables map[string]interface{}) (rootType str
 		op = opMatch[1]
 	}
 
-	// For now, extract data from variables if present
+	// Extract data from variables if present — variables always take precedence over inline data.
+	gotFromVariables := false
 	if variables != nil {
 		if d, ok := variables["data"]; ok {
 			if dm, ok := d.(map[string]interface{}); ok {
 				data = dm
+				gotFromVariables = true
 			}
 		}
 	}
 
-	// Try to extract inline data: data: { key: "value" ... }
-	dataMatch := regexp.MustCompile(`data\s*:\s*\{([^}]+)\}`).FindStringSubmatch(query)
-	if len(dataMatch) >= 2 {
-		pairs := regexp.MustCompile(`(\w+)\s*:\s*"([^"]*)"`).FindAllStringSubmatch(dataMatch[1], -1)
-		for _, p := range pairs {
-			data[p[1]] = p[2]
+	// Only parse inline data block when variables didn't provide it.
+	// This prevents inline data from silently overwriting variable values.
+	if !gotFromVariables {
+		if dataIdx := strings.Index(query, "data:"); dataIdx >= 0 {
+			afterData := strings.TrimSpace(query[dataIdx+5:])
+			if braceIdx := strings.Index(afterData, "{"); braceIdx >= 0 {
+				dataBody := extractBraceContent(afterData, braceIdx)
+				if dataBody != "" {
+					parseInlineData(dataBody, data)
+				}
+			}
 		}
 	}
 
@@ -628,4 +957,41 @@ func truncate(s string, maxLen int) string {
 		return s[:maxLen] + "..."
 	}
 	return s
+}
+
+// setGQLAuditCreate sets audit columns for GraphQL UPSERT (create path).
+func setGQLAuditCreate(ctx context.Context, data map[string]interface{}, meta *repository.ResourceMeta) {
+	now := time.Now()
+	email := gqlUserEmail(ctx)
+	setIfColExists(data, meta, "created_by", email)
+	setIfColExists(data, meta, "updated_by", email)
+	setIfColExists(data, meta, "created_date", now)
+	setIfColExists(data, meta, "updated_date", now)
+}
+
+// setGQLAuditUpdate sets audit columns for GraphQL UPSERT (update path).
+func setGQLAuditUpdate(ctx context.Context, data map[string]interface{}, meta *repository.ResourceMeta) {
+	now := time.Now()
+	email := gqlUserEmail(ctx)
+	setIfColExists(data, meta, "updated_by", email)
+	setIfColExists(data, meta, "updated_date", now)
+}
+
+func setIfColExists(data map[string]interface{}, meta *repository.ResourceMeta, col string, val interface{}) {
+	if meta == nil {
+		return
+	}
+	for _, c := range meta.Columns {
+		if c == col {
+			data[col] = val
+			return
+		}
+	}
+}
+
+func gqlUserEmail(ctx context.Context) string {
+	if user := middleware.GetUser(ctx); user != nil {
+		return user.Email
+	}
+	return ""
 }

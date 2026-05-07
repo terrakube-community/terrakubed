@@ -8,16 +8,22 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/terrakube-community/terrakubed/internal/api/jsonapi"
+	"github.com/terrakube-community/terrakubed/internal/api/middleware"
 	"github.com/terrakube-community/terrakubed/internal/api/repository"
+	"github.com/terrakube-community/terrakubed/internal/api/tcl"
 )
 
 // JSONAPIHandler handles generic JSON:API requests for all resource types.
 type JSONAPIHandler struct {
-	repo    *repository.GenericRepository
-	configs map[string]*jsonapi.ResourceConfig
+	repo         *repository.GenericRepository
+	configs      map[string]*jsonapi.ResourceConfig
+	tclProcessor *tcl.Processor
+	pool         *pgxpool.Pool
 }
 
 // NewJSONAPIHandler creates a new handler.
@@ -27,6 +33,13 @@ func NewJSONAPIHandler(repo *repository.GenericRepository) *JSONAPIHandler {
 		configs: make(map[string]*jsonapi.ResourceConfig),
 	}
 	h.buildConfigs()
+	return h
+}
+
+// WithPool wires the DB pool for lifecycle hooks (TCL step init, workspace unlock, etc.).
+func (h *JSONAPIHandler) WithPool(pool *pgxpool.Pool) *JSONAPIHandler {
+	h.pool = pool
+	h.tclProcessor = tcl.NewProcessor(pool)
 	return h
 }
 
@@ -115,17 +128,27 @@ func (h *JSONAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// /api/v1/{type}/{id} — Get, Update, or Delete
 		h.handleResource(w, r, segments[0], segments[1])
 	case len(segments) == 3:
-		// /api/v1/{type}/{id}/{relationship} — List related
+		// /api/v1/{type}/{id}/{relationship} — List related or create child
 		h.handleRelated(w, r, segments[0], segments[1], segments[2])
 	case len(segments) == 4 && segments[2] == "relationships":
 		// /api/v1/{type}/{id}/relationships/{rel} — Relationship link
 		h.handleRelationshipLink(w, r, segments[0], segments[1], segments[3])
-	case len(segments) == 4:
-		// /api/v1/{parentType}/{parentId}/{childType}/{childId}
-		// Nested resource access: resolve child by its ID directly
-		h.handleResource(w, r, segments[2], segments[3])
 	default:
-		writeError(w, http.StatusNotFound, "Invalid path")
+		// Deep nesting: /api/v1/{t0}/{id0}/{t1}/{id1}[/{t2}/{id2}...]
+		// Elide-style: find the last type/id pair and operate on it.
+		// If odd number of segments after /api/v1/, last segment is a relationship.
+		if len(segments)%2 == 0 {
+			// Even → last pair is the target resource
+			innerType := segments[len(segments)-2]
+			innerID := segments[len(segments)-1]
+			h.handleResource(w, r, innerType, innerID)
+		} else {
+			// Odd → last segment is a relationship on the penultimate resource
+			parentType := segments[len(segments)-3]
+			parentID := segments[len(segments)-2]
+			relName := segments[len(segments)-1]
+			h.handleRelated(w, r, parentType, parentID, relName)
+		}
 	}
 }
 
@@ -190,6 +213,52 @@ func (h *JSONAPIHandler) handleRelated(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 
+	parentID, err := parseID(parentIDStr, h.repo, parentType)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// ── To-one (parent) relationship navigation: GET /api/v1/{type}/{id}/{parentRel} ──
+	if toOneRel, isParent := parentConfig.ParentRels[relName]; isParent {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		// Load the source row to get the FK value
+		sourceRow, err := h.repo.FindByID(r.Context(), parentType, parentID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if sourceRow == nil {
+			writeError(w, http.StatusNotFound, "Resource not found")
+			return
+		}
+		fkVal := sourceRow[toOneRel.FKColumn]
+		if fkVal == nil {
+			// No related resource (null FK)
+			w.Header().Set("Content-Type", "application/vnd.api+json")
+			writeJSON(w, http.StatusOK, jsonapi.Document{Data: nil})
+			return
+		}
+		relConfig, ok := h.configs[toOneRel.TargetType]
+		if !ok {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("Unknown type: %s", toOneRel.TargetType))
+			return
+		}
+		relRow, err := h.repo.FindByID(r.Context(), toOneRel.TargetType, fkVal)
+		if err != nil || relRow == nil {
+			writeError(w, http.StatusNotFound, "Related resource not found")
+			return
+		}
+		basePath := "/api/v1"
+		writeJSON(w, http.StatusOK, jsonapi.SerializeSingle(relConfig, relRow, basePath))
+		return
+	}
+
+	// ── To-many (child) relationship navigation ──
+
 	// Check child relationships
 	childRel, ok := parentConfig.ChildRels[relName]
 	if !ok {
@@ -200,12 +269,6 @@ func (h *JSONAPIHandler) handleRelated(w http.ResponseWriter, r *http.Request, p
 	childConfig, ok := h.configs[childRel.TargetType]
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Unknown child type: %s", childRel.TargetType))
-		return
-	}
-
-	parentID, err := parseID(parentIDStr, h.repo, parentType)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -244,11 +307,26 @@ func (h *JSONAPIHandler) handleRelated(w http.ResponseWriter, r *http.Request, p
 			}
 		}
 
+		// Set audit fields
+		setAuditCreate(data, r, childMeta)
+
 		id, err := h.repo.Create(r.Context(), childRel.TargetType, data)
 		if err != nil {
 			log.Printf("Error creating %s under %s/%v: %v", childRel.TargetType, parentType, parentID, err)
 			writeError(w, http.StatusInternalServerError, "Failed to create resource")
 			return
+		}
+
+		// Post-create lifecycle hook: initialise TCL steps for new jobs
+		if childRel.TargetType == "job" && h.tclProcessor != nil {
+			jobID, _ := strconv.Atoi(fmt.Sprintf("%v", id))
+			if jobID > 0 {
+				go func() {
+					if err := h.tclProcessor.InitJobSteps(r.Context(), jobID); err != nil {
+						log.Printf("TCL step init failed for nested job %d: %v", jobID, err)
+					}
+				}()
+			}
 		}
 
 		row, err := h.repo.FindByID(r.Context(), childRel.TargetType, id)
@@ -350,15 +428,48 @@ func (h *JSONAPIHandler) listResources(w http.ResponseWriter, r *http.Request, r
 	// Parse query params for filtering, sorting, pagination
 	q := r.URL.Query()
 
-	// Filters: ?filter[name]=value
+	// Filters: Elide-style ?filter[field]=value or ?filter[field][op]=value
+	// Operators supported: [eq] (default), [in] (comma-separated list)
+	// Unrecognised operators are treated as equality (best-effort).
 	if params.Filters == nil {
 		params.Filters = make(map[string]interface{})
 	}
 	for key, values := range q {
-		if strings.HasPrefix(key, "filter[") && strings.HasSuffix(key, "]") {
-			filterName := key[7 : len(key)-1]
-			// Convert camelCase filter name to snake_case column name
-			colName := toSnakeCase(filterName)
+		if !strings.HasPrefix(key, "filter[") {
+			continue
+		}
+		// Extract field name: everything between first '[' and first ']'
+		inner := key[7:] // strip "filter["
+		closeBracket := strings.Index(inner, "]")
+		if closeBracket < 0 {
+			continue
+		}
+		fieldName := inner[:closeBracket]
+		colName := toSnakeCase(fieldName)
+
+		// Optional operator bracket: [eq], [in], [ne] …
+		rest := inner[closeBracket+1:]
+		op := "eq" // default
+		if strings.HasPrefix(rest, "[") && strings.HasSuffix(rest, "]") {
+			op = strings.ToLower(rest[1 : len(rest)-1])
+		}
+
+		switch op {
+		case "in":
+			// Value is a comma-separated list → build a slice
+			parts := strings.Split(values[0], ",")
+			list := make([]string, 0, len(parts))
+			for _, p := range parts {
+				if t := strings.TrimSpace(p); t != "" {
+					list = append(list, t)
+				}
+			}
+			params.Filters[colName] = list
+		case "ne":
+			// Not-equal — store as a special wrapper (repository handles if supported)
+			// For now fall through to equality so we at least don't panic
+			params.Filters[colName] = values[0]
+		default:
 			params.Filters[colName] = values[0]
 		}
 	}
@@ -389,6 +500,109 @@ func (h *JSONAPIHandler) listResources(w http.ResponseWriter, r *http.Request, r
 
 	basePath := "/api/v1"
 	doc := jsonapi.SerializeList(config, rows, basePath)
+
+	// Add pagination meta + links when pagination is active.
+	// Meta matches Elide's meta.page format; links are standard JSON:API pagination links.
+	if params.PageSize > 0 {
+		total, _ := h.repo.Count(r.Context(), resourceType, params)
+		currentPage := params.PageOffset/params.PageSize + 1
+		totalPages := (total + params.PageSize - 1) / params.PageSize
+		if totalPages < 1 {
+			totalPages = 1
+		}
+
+		doc.Meta = map[string]interface{}{
+			"page": map[string]interface{}{
+				"totalRecords": total,
+				"number":       currentPage,
+				"size":         params.PageSize,
+				"totalPages":   totalPages,
+			},
+		}
+
+		// Build self URL (preserve existing query params)
+		selfURL := r.URL.RequestURI()
+		baseURL := r.URL.Path
+
+		buildPageURL := func(pageNum int) string {
+			q2 := r.URL.Query()
+			q2.Set("page[number]", strconv.Itoa(pageNum))
+			q2.Set("page[size]", strconv.Itoa(params.PageSize))
+			return baseURL + "?" + q2.Encode()
+		}
+
+		links := &jsonapi.Links{
+			Self:  selfURL,
+			First: buildPageURL(1),
+			Last:  buildPageURL(totalPages),
+		}
+		if currentPage > 1 {
+			links.Prev = buildPageURL(currentPage - 1)
+		}
+		if currentPage < totalPages {
+			links.Next = buildPageURL(currentPage + 1)
+		}
+		doc.Links = links
+	}
+
+	// Handle ?include= on list responses: sideload related resources for every item.
+	// Tracks already-included IDs to avoid duplicates across the list.
+	if includes := r.URL.Query().Get("include"); includes != "" {
+		included := make(map[string]bool) // "type:id" dedup key
+		for _, row := range rows {
+			for _, relName := range strings.Split(includes, ",") {
+				relName = strings.TrimSpace(relName)
+
+				if childRel, ok := config.ChildRels[relName]; ok {
+					childConfig, ok := h.configs[childRel.TargetType]
+					if !ok {
+						continue
+					}
+					// Get the PK of this row to use as parent FK filter
+					pkVal := row[config.PKColumn]
+					if pkVal == nil {
+						continue
+					}
+					childRows, err := h.repo.List(r.Context(), childRel.TargetType, repository.ListParams{
+						ParentFK: childRel.FKColumn,
+						ParentID: pkVal,
+					})
+					if err != nil {
+						continue
+					}
+					childMeta, _ := h.repo.GetMeta(childRel.TargetType)
+					for _, childRow := range childRows {
+						key := fmt.Sprintf("%s:%v", childRel.TargetType, childRow[childMeta.PKColumn])
+						if !included[key] {
+							included[key] = true
+							doc.Included = append(doc.Included, jsonapi.Serialize(childConfig, childRow, basePath))
+						}
+					}
+
+				} else if parentRel, ok := config.ParentRels[relName]; ok {
+					fkVal := row[parentRel.FKColumn]
+					if fkVal == nil {
+						continue
+					}
+					parentConfig, ok := h.configs[parentRel.TargetType]
+					if !ok {
+						continue
+					}
+					key := fmt.Sprintf("%s:%v", parentRel.TargetType, fkVal)
+					if included[key] {
+						continue
+					}
+					parentRow, err := h.repo.FindByID(r.Context(), parentRel.TargetType, fkVal)
+					if err != nil || parentRow == nil {
+						continue
+					}
+					included[key] = true
+					doc.Included = append(doc.Included, jsonapi.Serialize(parentConfig, parentRow, basePath))
+				}
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, doc)
 }
 
@@ -408,30 +622,47 @@ func (h *JSONAPIHandler) getResource(w http.ResponseWriter, r *http.Request, res
 	doc := jsonapi.SerializeSingle(config, row, basePath)
 
 	// Handle ?include=rel1,rel2,...
+	// Supports both to-many (child) and to-one (parent) relationships.
 	if includes := r.URL.Query().Get("include"); includes != "" {
 		for _, relName := range strings.Split(includes, ",") {
 			relName = strings.TrimSpace(relName)
-			childRel, ok := config.ChildRels[relName]
-			if !ok {
-				continue // Skip unknown relationships
-			}
-			childConfig, ok := h.configs[childRel.TargetType]
-			if !ok {
-				continue
-			}
 
-			childRows, err := h.repo.List(r.Context(), childRel.TargetType, repository.ListParams{
-				ParentFK: childRel.FKColumn,
-				ParentID: id,
-			})
-			if err != nil {
-				log.Printf("Error loading include %s for %s/%v: %v", relName, resourceType, id, err)
-				continue
-			}
+			if childRel, ok := config.ChildRels[relName]; ok {
+				// ── To-many: load children whose FK points to this resource ──
+				childConfig, ok := h.configs[childRel.TargetType]
+				if !ok {
+					continue
+				}
+				childRows, err := h.repo.List(r.Context(), childRel.TargetType, repository.ListParams{
+					ParentFK: childRel.FKColumn,
+					ParentID: id,
+				})
+				if err != nil {
+					log.Printf("Error loading include %s for %s/%v: %v", relName, resourceType, id, err)
+					continue
+				}
+				for _, childRow := range childRows {
+					doc.Included = append(doc.Included, jsonapi.Serialize(childConfig, childRow, basePath))
+				}
 
-			for _, childRow := range childRows {
-				doc.Included = append(doc.Included, jsonapi.Serialize(childConfig, childRow, basePath))
+			} else if parentRel, ok := config.ParentRels[relName]; ok {
+				// ── To-one: load the parent resource referenced by the FK on this row ──
+				fkVal := row[parentRel.FKColumn]
+				if fkVal == nil {
+					continue
+				}
+				parentConfig, ok := h.configs[parentRel.TargetType]
+				if !ok {
+					continue
+				}
+				// Pass the raw FK value directly — pgx handles UUID/int types natively
+				parentRow, err := h.repo.FindByID(r.Context(), parentRel.TargetType, fkVal)
+				if err != nil || parentRow == nil {
+					continue
+				}
+				doc.Included = append(doc.Included, jsonapi.Serialize(parentConfig, parentRow, basePath))
 			}
+			// unknown relationship: silently skip
 		}
 	}
 
@@ -462,11 +693,27 @@ func (h *JSONAPIHandler) createResource(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
+	// Populate audit fields (created_by, updated_by, created_date, updated_date)
+	// only for columns that actually exist in the DB (validated at startup).
+	setAuditCreate(data, r, meta)
+
 	id, err := h.repo.Create(r.Context(), resourceType, data)
 	if err != nil {
 		log.Printf("Error creating %s: %v", resourceType, err)
 		writeError(w, http.StatusInternalServerError, "Failed to create resource")
 		return
+	}
+
+	// Post-create lifecycle hook: initialise TCL steps for new jobs
+	if resourceType == "job" && h.tclProcessor != nil {
+		jobID, _ := strconv.Atoi(fmt.Sprintf("%v", id))
+		if jobID > 0 {
+			go func() {
+				if err := h.tclProcessor.InitJobSteps(r.Context(), jobID); err != nil {
+					log.Printf("TCL step init failed for job %d: %v", jobID, err)
+				}
+			}()
+		}
 	}
 
 	// Reload and return
@@ -497,10 +744,52 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 
 	data := jsonapi.Deserialize(config, reqDoc.Data)
 
+	// Populate audit fields for UPDATE (updated_by, updated_date)
+	meta, _ := h.repo.GetMeta(resourceType)
+	setAuditUpdate(data, r, meta)
+
 	if err := h.repo.Update(r.Context(), resourceType, id, data); err != nil {
 		log.Printf("Error updating %s/%v: %v", resourceType, id, err)
 		writeError(w, http.StatusInternalServerError, "Failed to update resource")
 		return
+	}
+
+	// Post-update lifecycle hooks
+	if resourceType == "job" && h.pool != nil {
+		if newStatus, ok := data["status"].(string); ok {
+			switch newStatus {
+			case "completed", "failed", "noChanges", "rejected", "cancelled":
+				// Unlock the workspace when a job reaches any terminal state.
+				// The executor K8s pod updates job status directly via API; the scheduler
+				// doesn't see terminal-state jobs in its poll loop so workspace unlock
+				// must happen here instead.
+				// Also update workspace.last_job_status / last_job_date for the UI.
+				go func(jobID interface{}, status string) {
+					ctx := r.Context()
+					_, err := h.pool.Exec(ctx,
+						`UPDATE workspace SET
+						   locked = false,
+						   last_job_status = $2,
+						   last_job_date = NOW()
+						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`,
+						jobID, status)
+					if err != nil {
+						log.Printf("Failed to unlock/update workspace for job %v: %v", jobID, err)
+					} else {
+						log.Printf("Job %v terminal state %q — workspace unlocked, last_job_status updated", jobID, status)
+					}
+				}(id, newStatus)
+			case "running":
+				// Update last_job_status to "running" so the UI shows the workspace as active
+				go func(jobID interface{}) {
+					ctx := r.Context()
+					_, _ = h.pool.Exec(ctx,
+						`UPDATE workspace SET last_job_status = 'running'
+						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`,
+						jobID)
+				}(id)
+			}
+		}
 	}
 
 	// Reload and return
@@ -588,4 +877,65 @@ func toSnakeCase(s string) string {
 		}
 	}
 	return result.String()
+}
+
+// hasColumn reports whether the given DB column is registered (and thus exists) for the resource.
+func hasColumn(meta *repository.ResourceMeta, col string) bool {
+	if meta == nil {
+		return false
+	}
+	for _, c := range meta.Columns {
+		if c == col {
+			return true
+		}
+	}
+	return false
+}
+
+// setAuditCreate populates created_by, updated_by, created_date, updated_date
+// on a new-resource data map from the authenticated request user.
+// Only sets fields whose columns actually exist in the DB (safe to call unconditionally).
+func setAuditCreate(data map[string]interface{}, r *http.Request, meta *repository.ResourceMeta) {
+	now := time.Now()
+	email := ""
+	if user := middleware.GetUser(r.Context()); user != nil {
+		email = user.Email
+	}
+
+	if hasColumn(meta, "created_by") {
+		if _, already := data["created_by"]; !already {
+			data["created_by"] = email
+		}
+	}
+	if hasColumn(meta, "updated_by") {
+		if _, already := data["updated_by"]; !already {
+			data["updated_by"] = email
+		}
+	}
+	if hasColumn(meta, "created_date") {
+		if _, already := data["created_date"]; !already {
+			data["created_date"] = now
+		}
+	}
+	if hasColumn(meta, "updated_date") {
+		if _, already := data["updated_date"]; !already {
+			data["updated_date"] = now
+		}
+	}
+}
+
+// setAuditUpdate populates updated_by and updated_date on an update data map.
+func setAuditUpdate(data map[string]interface{}, r *http.Request, meta *repository.ResourceMeta) {
+	now := time.Now()
+	email := ""
+	if user := middleware.GetUser(r.Context()); user != nil {
+		email = user.Email
+	}
+
+	if hasColumn(meta, "updated_by") {
+		data["updated_by"] = email
+	}
+	if hasColumn(meta, "updated_date") {
+		data["updated_date"] = now
+	}
 }
