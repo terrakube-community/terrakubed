@@ -64,13 +64,25 @@ func (h *TerraformStateHandler) getState(w http.ResponseWriter, r *http.Request,
 
 	log.Printf("Get state: org=%s ws=%s file=%s", orgID, wsID, stateFile)
 
-	// Read from storage backend
+	// Read from storage backend.
+	// Try the exact filename first (new uploads use .json), then fall back to
+	// .tfstate for state files uploaded by older versions of the API.
 	storagePath := fmt.Sprintf("tfstate/%s/%s/%s", orgID, wsID, stateFile)
 	reader, err := h.storage.DownloadFile(storagePath)
 	if err != nil {
-		log.Printf("Error reading state: %v", err)
-		http.Error(w, "State not found", http.StatusNotFound)
-		return
+		// Fallback: swap extension (.json ↔ .tfstate) for historical files
+		alt := storagePath
+		if strings.HasSuffix(storagePath, ".json") {
+			alt = strings.TrimSuffix(storagePath, ".json") + ".tfstate"
+		} else if strings.HasSuffix(storagePath, ".tfstate") {
+			alt = strings.TrimSuffix(storagePath, ".tfstate") + ".json"
+		}
+		reader, err = h.storage.DownloadFile(alt)
+		if err != nil {
+			log.Printf("Error reading state (tried %s and %s): %v", storagePath, alt, err)
+			http.Error(w, "State not found", http.StatusNotFound)
+			return
+		}
 	}
 	defer reader.Close()
 
@@ -113,8 +125,9 @@ func (h *TerraformStateHandler) uploadHostedState(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Upload to storage backend
-	storagePath := fmt.Sprintf("tfstate/%s/%s/%s.tfstate", orgID, wsID, historyID)
+	// Upload to storage backend.
+	// Use .json extension to match the download URL (state/{historyId}.json).
+	storagePath := fmt.Sprintf("tfstate/%s/%s/%s.json", orgID, wsID, historyID)
 	if err := h.storage.UploadFile(storagePath, bytes.NewReader(body)); err != nil {
 		log.Printf("Error uploading state to storage: %v", err)
 		http.Error(w, "Failed to upload state", http.StatusInternalServerError)
