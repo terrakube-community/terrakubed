@@ -495,10 +495,10 @@ type gqlPage struct {
 var (
 	// Matches root type: { organization { ... } }
 	rootTypeRe = regexp.MustCompile(`(?:query\s*(?:\w+)?\s*)?[{]\s*(\w+)`)
-	// Matches ids parameter: (ids: ["id1", "id2"])
-	idsRe = regexp.MustCompile(`\(\s*ids?\s*:\s*\[([^\]]*)\]`)
-	// Matches single id filter: (id: "uuid")
-	singleIDRe = regexp.MustCompile(`\(\s*ids?\s*:\s*"([^"]+)"`)
+	// Matches ids parameter: ids: ["id1", "id2"] (anywhere in args)
+	idsRe = regexp.MustCompile(`\bids?\s*:\s*\[([^\]]*)\]`)
+	// Matches single id filter: id: "uuid" (anywhere in args)
+	singleIDRe = regexp.MustCompile(`\bids?\s*:\s*"([^"]+)"`)
 	// Matches pagination: (pagination: {number: N, size: M})
 	pageRe = regexp.MustCompile(`pagination\s*:\s*\{[^}]*number\s*:\s*(\d+)[^}]*size\s*:\s*(\d+)[^}]*\}`)
 	pageRe2 = regexp.MustCompile(`pagination\s*:\s*\{[^}]*size\s*:\s*(\d+)[^}]*number\s*:\s*(\d+)[^}]*\}`)
@@ -601,7 +601,7 @@ func parseFilterArg(args string) string {
 //   - "parentType.id=='uuid'"    → Filters[fk_column] = "uuid"  (resolved via meta.Parents)
 //   - Multiple with ';' or ','   → AND-combined (all conditions applied)
 func parseElideFilter(expr string, meta *repository.ResourceMeta) map[string]interface{} {
-	if expr == "" || meta == nil {
+	if expr == "" {
 		return nil
 	}
 
@@ -625,12 +625,17 @@ func parseElideFilter(expr string, meta *repository.ResourceMeta) map[string]int
 			parentTypeName := field[:dot]
 			// attribute := field[dot+1:] // e.g. "id" — we use the FK column regardless
 
-			// Find the FK column for this parent type
-			for _, parent := range meta.Parents {
-				if parent.ParentType == parentTypeName {
-					filters[parent.FKColumn] = value
-					break
+			if meta != nil {
+				// Find the FK column for this parent type
+				for _, parent := range meta.Parents {
+					if parent.ParentType == parentTypeName {
+						filters[parent.FKColumn] = value
+						break
+					}
 				}
+			} else {
+				// No meta — fall back to "parentType_id" convention
+				filters[camelToSnake(parentTypeName)+"_id"] = value
 			}
 			continue
 		}
@@ -828,22 +833,27 @@ func parseMutation(query string, variables map[string]interface{}) (rootType str
 		op = opMatch[1]
 	}
 
-	// For now, extract data from variables if present
+	// Extract data from variables if present — variables always take precedence over inline data.
+	gotFromVariables := false
 	if variables != nil {
 		if d, ok := variables["data"]; ok {
 			if dm, ok := d.(map[string]interface{}); ok {
 				data = dm
+				gotFromVariables = true
 			}
 		}
 	}
 
-	// Try to extract inline data block: data: { ... } (using brace matching)
-	if dataIdx := strings.Index(query, "data:"); dataIdx >= 0 {
-		afterData := strings.TrimSpace(query[dataIdx+5:])
-		if braceIdx := strings.Index(afterData, "{"); braceIdx >= 0 {
-			dataBody := extractBraceContent(afterData, braceIdx)
-			if dataBody != "" {
-				parseInlineData(dataBody, data)
+	// Only parse inline data block when variables didn't provide it.
+	// This prevents inline data from silently overwriting variable values.
+	if !gotFromVariables {
+		if dataIdx := strings.Index(query, "data:"); dataIdx >= 0 {
+			afterData := strings.TrimSpace(query[dataIdx+5:])
+			if braceIdx := strings.Index(afterData, "{"); braceIdx >= 0 {
+				dataBody := extractBraceContent(afterData, braceIdx)
+				if dataBody != "" {
+					parseInlineData(dataBody, data)
+				}
 			}
 		}
 	}
