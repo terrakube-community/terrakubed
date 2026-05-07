@@ -265,7 +265,7 @@ func (h *TeamTokenHandler) getPermissions(w http.ResponseWriter, r *http.Request
 		} else {
 			for _, g := range user.Groups {
 				groups = append(groups, strings.TrimSpace(g))
-				if strings.TrimSpace(g) == h.ownerGroup {
+				if strings.EqualFold(strings.TrimSpace(g), h.ownerGroup) {
 					isOwner = true
 				}
 			}
@@ -273,6 +273,7 @@ func (h *TeamTokenHandler) getPermissions(w http.ResponseWriter, r *http.Request
 	}
 
 	permissions := map[string]bool{
+		// Core manage flags (checked by workspace details page and newer UI settings pages)
 		"manageState":      isOwner,
 		"manageWorkspace":  isOwner,
 		"manageModule":     isOwner,
@@ -281,6 +282,14 @@ func (h *TeamTokenHandler) getPermissions(w http.ResponseWriter, r *http.Request
 		"manageTemplate":   isOwner,
 		"manageCollection": isOwner,
 		"manageJob":        isOwner,
+		// Extended flags expected by newer UI versions for Settings page create buttons.
+		// These are owner-only operations: creating teams, global vars, agents, federated creds, etc.
+		"manageTeam":       isOwner,
+		"manageGlobalVar":  isOwner,
+		"manageAgent":      isOwner,
+		"manageFederated":  isOwner,
+		"manageAccess":     isOwner,
+		"manageSsh":        isOwner,
 	}
 
 	if !isOwner {
