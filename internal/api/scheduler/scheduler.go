@@ -203,12 +203,22 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		}
 
 		// ── pending → queue ─────────────────────────────────────────────────
+		// A job is "pending" when:
+		//   a) it was just created (before any steps run), or
+		//   b) an intermediate step (e.g. plan) completed and the executor called
+		//      SetPending() to signal "more steps remain".
+		// In both cases the workspace may be locked from a previous step.
+		// We must unlock it here so the scheduler's next poll can pick it up
+		// (the poll query requires w.locked IS NOT TRUE for queue jobs).
+		// The workspace will be re-locked when the next executor step starts.
 		if status == "pending" {
+			_, _ = s.pool.Exec(ctx,
+				"UPDATE workspace SET locked = false WHERE id = (SELECT workspace_id FROM job WHERE id = $1)", jobID)
 			if _, err := s.pool.Exec(ctx,
 				"UPDATE job SET status = 'queue' WHERE id = $1", jobID); err != nil {
 				log.Printf("Job %d: failed to queue: %v", jobID, err)
 			} else {
-				log.Printf("Job %d queued", jobID)
+				log.Printf("Job %d queued (workspace unlocked for next step)", jobID)
 			}
 			continue
 		}
