@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/terrakube-community/terrakubed/internal/auth"
 	"github.com/terrakube-community/terrakubed/internal/config"
@@ -196,6 +198,30 @@ func (p *JobProcessor) ProcessJob(job *model.TerraformJob) error {
 
 	log.Printf("Processing Job: %s", job.JobId)
 
+	// Create a cancellable context for the entire job.  A background goroutine
+	// polls the API every 10 seconds; if the job has been cancelled (via UI or
+	// TFE CLI) it fires cancelFn(), which propagates to every exec.CommandContext
+	// call inside executeTerraform — killing the active Terraform subprocess.
+	ctx, cancelFn := context.WithCancel(context.Background())
+	defer cancelFn()
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if p.Status.IsCancelled(job) {
+					log.Printf("Job %s: cancel detected — aborting Terraform execution", job.JobId)
+					cancelFn()
+					return
+				}
+			}
+		}
+	}()
+
 	// 1. Update Status to Running
 	if err := p.Status.SetRunning(job); err != nil {
 		log.Printf("Failed to set running status: %v", err)
@@ -266,7 +292,7 @@ func (p *JobProcessor) ProcessJob(job *model.TerraformJob) error {
 	var executionErr error
 	switch job.Type {
 	case "terraformPlan", "terraformPlanDestroy", "terraformApply", "terraformDestroy":
-		executionErr = p.executeTerraform(job, workingDir, streamer, &logBuffer)
+		executionErr = p.executeTerraform(ctx, job, workingDir, streamer, &logBuffer)
 
 	case "customScripts", "approval":
 		scriptExecutor := script.NewExecutor(job, workingDir, streamer)
@@ -293,7 +319,7 @@ func (p *JobProcessor) ProcessJob(job *model.TerraformJob) error {
 	return executionErr
 }
 
-func (p *JobProcessor) executeTerraform(job *model.TerraformJob, workingDir string, streamer logs.LogStreamer, logBuffer *bytes.Buffer) error {
+func (p *JobProcessor) executeTerraform(ctx context.Context, job *model.TerraformJob, workingDir string, streamer logs.LogStreamer, logBuffer *bytes.Buffer) error {
 	execPath, err := p.VersionManager.Install(job.TerraformVersion, job.Tofu)
 	if err != nil {
 		return fmt.Errorf("failed to install terraform %s: %w", job.TerraformVersion, err)
@@ -328,9 +354,17 @@ func (p *JobProcessor) executeTerraform(job *model.TerraformJob, workingDir stri
 	}
 
 	tfExecutor := terraform.NewExecutor(job, workingDir, streamer, execPath)
-	result, err := tfExecutor.Execute()
+	result, err := tfExecutor.Execute(ctx)
 
 	if err != nil {
+		// If the job was cancelled, update status and exit cleanly without
+		// running onFailure scripts or triggering failure notifications.
+		if ctx.Err() != nil {
+			output := logBuffer.String() + "\n[Terrakube] Job cancelled by user — Terraform process terminated."
+			p.Status.SetCompleted(job, false, output)
+			return fmt.Errorf("job cancelled")
+		}
+
 		scriptExec.ExecutePhase("onFailure")
 		p.notifySlackOnFailure(job)
 

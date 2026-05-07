@@ -20,6 +20,9 @@ type StatusService interface {
 	SetApprovalCompleted(job *model.TerraformJob, output string) error
 	UpdateCommitId(job *model.TerraformJob, commitId string) error
 	CreateHistory(job *model.TerraformJob, stateURL string) error
+	// IsCancelled polls the API to check whether the job has been cancelled.
+	// Used by the executor to abort active Terraform runs when a user cancels.
+	IsCancelled(job *model.TerraformJob) bool
 }
 
 type Service struct {
@@ -114,6 +117,17 @@ func (s *Service) SetApprovalCompleted(job *model.TerraformJob, output string) e
 
 func (s *Service) UpdateCommitId(job *model.TerraformJob, commitId string) error {
 	return s.client.UpdateJobCommitId(job.OrganizationId, job.JobId, commitId)
+}
+
+// IsCancelled checks the API to determine whether the job has been cancelled.
+// Returns true if the job status is "cancelled"; false on any error (fail open).
+func (s *Service) IsCancelled(job *model.TerraformJob) bool {
+	status, err := s.client.GetJobStatus(job.OrganizationId, job.JobId)
+	if err != nil {
+		log.Printf("IsCancelled: failed to fetch job %s status: %v", job.JobId, err)
+		return false
+	}
+	return status == "cancelled"
 }
 
 func (s *Service) CreateHistory(job *model.TerraformJob, stateURL string) error {

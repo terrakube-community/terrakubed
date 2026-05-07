@@ -398,6 +398,16 @@ func (h *RemoteTFEHandler) handleRuns(w http.ResponseWriter, r *http.Request, pa
 		runID := strings.TrimSuffix(sub, "/actions/apply")
 		h.applyRun(w, r, runID)
 
+	// POST /runs/{runId}/actions/cancel — cancel an in-progress run (planning/applying)
+	case r.Method == http.MethodPost && strings.HasSuffix(sub, "/actions/cancel"):
+		runID := strings.TrimSuffix(sub, "/actions/cancel")
+		h.cancelRun(w, r, runID)
+
+	// POST /runs/{runId}/actions/force-cancel — force-cancel after cancel grace period
+	case r.Method == http.MethodPost && strings.HasSuffix(sub, "/actions/force-cancel"):
+		runID := strings.TrimSuffix(sub, "/actions/force-cancel")
+		h.cancelRun(w, r, runID) // same logic; no grace period in our implementation
+
 	// POST /runs/{runId}/actions/discard — discard/cancel the run
 	case r.Method == http.MethodPost && strings.HasSuffix(sub, "/actions/discard"):
 		runID := strings.TrimSuffix(sub, "/actions/discard")
@@ -560,6 +570,30 @@ func (h *RemoteTFEHandler) applyRun(w http.ResponseWriter, r *http.Request, runI
 	w.WriteHeader(http.StatusOK)
 }
 
+// cancelRun handles POST /remote/tfe/v2/runs/{runId}/actions/cancel
+// and POST …/actions/force-cancel.
+//
+// Unlike discard (which targets planned/pending runs), cancel is for runs that
+// are actively executing (status planning or applying).  We mark the job
+// cancelled and unlock the workspace; the scheduler's pollCancels loop then
+// deletes the Kubernetes Job so the Terraform process is killed immediately.
+func (h *RemoteTFEHandler) cancelRun(w http.ResponseWriter, r *http.Request, runID string) {
+	jobID, err := parseRunID(runID)
+	if err != nil {
+		http.Error(w, "invalid run id", http.StatusBadRequest)
+		return
+	}
+
+	h.pool.Exec(r.Context(), "UPDATE job SET status = 'cancelled' WHERE id = $1 AND status IN ('running','queue','pending')", jobID)
+	h.pool.Exec(r.Context(),
+		`UPDATE workspace SET locked = false, last_job_status = 'cancelled', last_job_date = NOW()
+		 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID)
+
+	log.Printf("TFE: run %s (job %d) cancelled — workspace unlocked, executor will be killed by pollCancels", runID, jobID)
+	// TFE spec: 202 Accepted for cancel (async)
+	w.WriteHeader(http.StatusAccepted)
+}
+
 // discardRun handles POST /remote/tfe/v2/runs/{runId}/actions/discard
 func (h *RemoteTFEHandler) discardRun(w http.ResponseWriter, r *http.Request, runID string) {
 	jobID, err := parseRunID(runID)
@@ -618,13 +652,15 @@ func (h *RemoteTFEHandler) buildRunDoc(runID string, jobID int, tfeStatus, wsID,
 				"message":           "",
 				"status-timestamps": map[string]string{},
 				"actions": map[string]interface{}{
-					"is-confirmable": tfeStatus == "planned" && !aa,
-					"is-discardable": tfeStatus == "planned" || tfeStatus == "pending",
-					"is-cancelable":  tfeStatus == "planning" || tfeStatus == "applying",
+					"is-confirmable":   tfeStatus == "planned" && !aa,
+					"is-discardable":   tfeStatus == "planned" || tfeStatus == "pending",
+					"is-cancelable":    tfeStatus == "planning" || tfeStatus == "applying",
+					"is-force-cancelable": tfeStatus == "planning" || tfeStatus == "applying",
 				},
 				"permissions": map[string]bool{
 					"can-apply":         true,
 					"can-cancel":        true,
+					"can-force-cancel":  true,
 					"can-discard":       true,
 					"can-force-execute": true,
 				},
