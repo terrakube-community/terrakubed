@@ -126,6 +126,17 @@ func NewServer(config Config) (*Server, error) {
 	graphqlHandler := handler.NewGraphQLHandler(repo)
 	mux.Handle("/graphql/api/v1", graphqlHandler)
 
+	// /api/v1/federated — stub returning an empty JSON:API list.
+	// The UI polls this endpoint on startup (likely a remnant of Elide's federation schema
+	// discovery). There is no "federated" DB entity; we just need to return 200 so the
+	// UI doesn't show an error. The more-specific fixed path takes precedence over the
+	// /api/v1/ prefix pattern in Go's ServeMux.
+	mux.HandleFunc("/api/v1/federated", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.api+json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"data":[],"meta":{"page":{"totalRecords":0,"number":1,"totalPages":1,"limit":10}}}`))
+	})
+
 	// JSON:API CRUD endpoints
 	mux.Handle("/api/v1/", jsonapiHandler)
 
