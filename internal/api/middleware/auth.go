@@ -100,8 +100,6 @@ var publicPaths = []string{
 }
 
 var publicPrefixPaths = []string{
-	"/remote/tfe/v2/plans/logs/",
-	"/remote/tfe/v2/applies/logs/",
 	"/tofu/index.json",
 }
 
@@ -119,6 +117,17 @@ func isPublicPath(path string, method string) bool {
 
 	for _, p := range publicPrefixPaths {
 		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+
+	// Terraform CLI fetches plan/apply logs without an auth header.
+	// Paths follow the pattern /{resource}/{id}/log(s) — match only GET requests.
+	if method == http.MethodGet {
+		if strings.HasPrefix(path, "/remote/tfe/v2/plans/") && strings.HasSuffix(path, "/log") {
+			return true
+		}
+		if strings.HasPrefix(path, "/remote/tfe/v2/applies/") && strings.HasSuffix(path, "/logs") {
 			return true
 		}
 	}
@@ -148,17 +157,22 @@ func AuthMiddleware(config AuthConfig) func(http.Handler) http.Handler {
 				return
 			}
 
-			// Extract Bearer token
-			authHeader := r.Header.Get("Authorization")
-			if authHeader == "" {
-				http.Error(w, `{"errors":[{"status":"401","title":"Unauthorized","detail":"Missing Authorization header"}]}`, http.StatusUnauthorized)
-				return
-			}
-
-			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if token == authHeader {
-				http.Error(w, `{"errors":[{"status":"401","title":"Unauthorized","detail":"Invalid Authorization header format"}]}`, http.StatusUnauthorized)
-				return
+			// Extract Bearer token — accept both Authorization: Bearer <t> and X-TFC-Token: <t>
+			// The Terraform CLI uses X-TFC-Token when talking to the TFE remote backend.
+			token := ""
+			if tfcToken := r.Header.Get("X-TFC-Token"); tfcToken != "" {
+				token = tfcToken
+			} else {
+				authHeader := r.Header.Get("Authorization")
+				if authHeader == "" {
+					http.Error(w, `{"errors":[{"status":"401","title":"Unauthorized","detail":"Missing Authorization header"}]}`, http.StatusUnauthorized)
+					return
+				}
+				token = strings.TrimPrefix(authHeader, "Bearer ")
+				if token == authHeader {
+					http.Error(w, `{"errors":[{"status":"401","title":"Unauthorized","detail":"Invalid Authorization header format"}]}`, http.StatusUnauthorized)
+					return
+				}
 			}
 
 			// Decode JWT claims (without signature verification first to determine issuer)

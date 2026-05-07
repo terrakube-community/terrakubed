@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/terrakube-community/terrakubed/internal/api/tcl"
 	"github.com/terrakube-community/terrakubed/internal/api/vcs"
+	"github.com/terrakube-community/terrakubed/internal/storage"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,6 +28,7 @@ type JobScheduler struct {
 	pool     *pgxpool.Pool
 	executor Executor
 	interval time.Duration
+	storage  storage.StorageService
 }
 
 // Executor is the interface for job execution backends.
@@ -102,11 +104,12 @@ func (a *AgentExecutor) Execute(ctx context.Context, execCtx *ExecutionContext) 
 }
 
 // NewJobScheduler creates a new scheduler.
-func NewJobScheduler(pool *pgxpool.Pool, executor Executor, interval time.Duration) *JobScheduler {
+func NewJobScheduler(pool *pgxpool.Pool, executor Executor, interval time.Duration, store storage.StorageService) *JobScheduler {
 	return &JobScheduler{
 		pool:     pool,
 		executor: executor,
 		interval: interval,
+		storage:  store,
 	}
 }
 
@@ -295,6 +298,11 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		}
 		execCtx.EnvVars = s.loadVariables(ctx, orgID, workspaceID, "ENV")
 		execCtx.TFVars = s.loadVariables(ctx, orgID, workspaceID, "TERRAFORM")
+
+		// Write context.json to storage so Java executor agents can fetch it via
+		// GET /context/v1/{jobId}.  We write it once per job (idempotent: same path
+		// is overwritten if the job is retried from a different step).
+		s.writeContextJSON(ctx, execCtx)
 
 		_, _ = s.pool.Exec(ctx,
 			"UPDATE step SET status = 'running' WHERE id = $1", stepID)
@@ -516,6 +524,27 @@ func (s *JobScheduler) loadVariables(ctx context.Context, orgID, workspaceID, ca
 	}
 
 	return vars
+}
+
+// writeContextJSON serialises the ExecutionContext and uploads it to storage at
+// tfplan/{jobId}/context.json so that Java executor agents can retrieve it via
+// GET /context/v1/{jobId}.  Failures are non-fatal — the agent falls back to
+// the payload it received directly.
+func (s *JobScheduler) writeContextJSON(ctx context.Context, execCtx *ExecutionContext) {
+	if s.storage == nil {
+		return
+	}
+	data, err := json.Marshal(execCtx)
+	if err != nil {
+		log.Printf("Job %d: failed to marshal context.json: %v", execCtx.JobID, err)
+		return
+	}
+	path := fmt.Sprintf("tfplan/%d/context.json", execCtx.JobID)
+	if err := s.storage.UploadFile(path, bytes.NewReader(data)); err != nil {
+		log.Printf("Job %d: failed to write context.json to storage: %v", execCtx.JobID, err)
+	} else {
+		log.Printf("Job %d: wrote context.json to %s", execCtx.JobID, path)
+	}
 }
 
 // MarshalJSON serializes ExecutionContext to JSON for passing to ephemeral pods.

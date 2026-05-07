@@ -176,7 +176,14 @@ func TestIsPublicPath(t *testing.T) {
 		{"/callback/v1/github", "GET", true},
 		{"/.well-known/terraform.json", "GET", true},
 		{"/remote/tfe/v2/ping", "GET", true},
-		{"/remote/tfe/v2/plans/logs/123", "GET", true},
+		// Terraform CLI plan/apply log endpoints — public GET only
+		{"/remote/tfe/v2/plans/plan-123/log", "GET", true},
+		{"/remote/tfe/v2/plans/plan-123/log", "POST", false},
+		{"/remote/tfe/v2/applies/apply-456/logs", "GET", true},
+		{"/remote/tfe/v2/applies/apply-456/logs", "DELETE", false},
+		// apply/plan status (no suffix) — not public
+		{"/remote/tfe/v2/plans/plan-123", "GET", false},
+		{"/remote/tfe/v2/applies/apply-456", "GET", false},
 	}
 
 	for _, tt := range tests {

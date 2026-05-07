@@ -205,7 +205,7 @@ func NewServer(config Config) (*Server, error) {
 
 	var jobScheduler *scheduler.JobScheduler
 	if executor != nil {
-		jobScheduler = scheduler.NewJobScheduler(db.Pool, executor, 5*time.Second)
+		jobScheduler = scheduler.NewJobScheduler(db.Pool, executor, 5*time.Second, storageService)
 	}
 
 	// Schedule poller: watches workspace schedules and triggers cron jobs

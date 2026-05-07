@@ -166,6 +166,10 @@ func (h *RemoteTFEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 
+	// GET /account/details — return current user info for the Terraform CLI
+	case path == "account/details":
+		h.handleAccountDetails(w, r)
+
 	case strings.HasPrefix(path, "workspaces"):
 		h.handleWorkspaces(w, r, path)
 
@@ -184,6 +188,9 @@ func (h *RemoteTFEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "configuration-versions"):
 		h.handleConfigVersions(w, r, path)
 
+	case strings.HasPrefix(path, "organizations"):
+		h.handleOrganizations(w, r, path)
+
 	default:
 		http.Error(w, "Not found", http.StatusNotFound)
 	}
@@ -201,12 +208,14 @@ func (h *RemoteTFEHandler) handleWorkspaces(w http.ResponseWriter, r *http.Reque
 		}
 
 		var wsID, orgID string
-		var locked bool
+		var locked, allowRemoteApply bool
 		var terraformVersion *string
 		err := h.pool.QueryRow(r.Context(),
-			"SELECT w.id, w.organization_id, w.locked, w.terraform_version FROM workspace w WHERE w.name = $1 AND w.deleted = false LIMIT 1",
+			`SELECT w.id, w.organization_id, w.locked, w.terraform_version,
+			        COALESCE(w.allow_remote_apply, false)
+			 FROM workspace w WHERE w.name = $1 AND w.deleted = false LIMIT 1`,
 			name,
-		).Scan(&wsID, &orgID, &locked, &terraformVersion)
+		).Scan(&wsID, &orgID, &locked, &terraformVersion, &allowRemoteApply)
 		if err != nil {
 			http.Error(w, "Workspace not found", http.StatusNotFound)
 			return
@@ -223,9 +232,13 @@ func (h *RemoteTFEHandler) handleWorkspaces(w http.ResponseWriter, r *http.Reque
 					"id":   wsID,
 					"type": "workspaces",
 					"attributes": map[string]interface{}{
-						"name":              name,
-						"locked":            locked,
-						"terraform-version": tfVer,
+						"name":               name,
+						"locked":             locked,
+						"terraform-version":  tfVer,
+						// allow-remote-apply maps to TFC's auto-apply: when remote apply is
+						// allowed the CLI can trigger applies without a separate confirm step.
+						"auto-apply":         allowRemoteApply,
+						"execution-mode":     "remote",
 						"permissions": map[string]bool{
 							"can-queue-run":  true,
 							"can-lock":       true,
@@ -404,6 +417,7 @@ func (h *RemoteTFEHandler) createRun(w http.ResponseWriter, r *http.Request) {
 			Attributes struct {
 				Message   string `json:"message"`
 				IsDestroy bool   `json:"is-destroy"`
+				AutoApply bool   `json:"auto-apply"`
 			} `json:"attributes"`
 			Relationships struct {
 				Workspace struct {
@@ -452,12 +466,12 @@ func (h *RemoteTFEHandler) createRun(w http.ResponseWriter, r *http.Request) {
 	err = h.pool.QueryRow(r.Context(), `
 		INSERT INTO job (status, output, comments, commit_id, template_reference, via,
 		                 refresh, refresh_only, plan_changes, terraform_plan, approval_team,
-		                 organization_id, workspace_id, override_source, override_branch)
+		                 auto_apply, organization_id, workspace_id, override_source, override_branch)
 		VALUES ('pending', '', $1, '', $2, 'cli',
 		        false, false, false, '', '',
-		        $3, $4, $5, $6)
+		        $3, $4, $5, $6, $7)
 		RETURNING id
-	`, req.Data.Attributes.Message, defaultTemplate, orgID, wsID, overrideSource, overrideBranch).Scan(&jobID)
+	`, req.Data.Attributes.Message, defaultTemplate, req.Data.Attributes.AutoApply, orgID, wsID, overrideSource, overrideBranch).Scan(&jobID)
 	if err != nil {
 		log.Printf("TFE createRun: failed to create job: %v", err)
 		http.Error(w, "failed to create run", http.StatusInternalServerError)
@@ -473,7 +487,7 @@ func (h *RemoteTFEHandler) createRun(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	runID := fmt.Sprintf("run-%d", jobID)
-	doc := h.buildRunDoc(runID, jobID, "pending", wsID, "planning")
+	doc := h.buildRunDoc(runID, jobID, "pending", wsID, "planning", req.Data.Attributes.AutoApply)
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(doc)
 }
@@ -488,10 +502,11 @@ func (h *RemoteTFEHandler) getRun(w http.ResponseWriter, r *http.Request, runID 
 
 	var jobStatus, wsID string
 	var jobTCL *string
+	var autoApply bool
 	err = h.pool.QueryRow(r.Context(), `
-		SELECT j.status, j.workspace_id::text, j.tcl
+		SELECT j.status, j.workspace_id::text, j.tcl, COALESCE(j.auto_apply, false)
 		FROM job j WHERE j.id = $1
-	`, jobID).Scan(&jobStatus, &wsID, &jobTCL)
+	`, jobID).Scan(&jobStatus, &wsID, &jobTCL, &autoApply)
 	if err != nil {
 		http.Error(w, "run not found", http.StatusNotFound)
 		return
@@ -501,7 +516,7 @@ func (h *RemoteTFEHandler) getRun(w http.ResponseWriter, r *http.Request, runID 
 	currentStepType := h.currentStepType(r.Context(), jobID, derefStr(jobTCL))
 	tfeStatus := jobStatusToTFE(jobStatus, currentStepType)
 
-	doc := h.buildRunDoc(runID, jobID, tfeStatus, wsID, currentStepType)
+	doc := h.buildRunDoc(runID, jobID, tfeStatus, wsID, currentStepType, autoApply)
 	json.NewEncoder(w).Encode(doc)
 }
 
@@ -560,13 +575,18 @@ func (h *RemoteTFEHandler) getRunPlan(w http.ResponseWriter, r *http.Request, ru
 }
 
 // buildRunDoc builds a TFE-compatible run response document.
-func (h *RemoteTFEHandler) buildRunDoc(runID string, jobID int, tfeStatus, wsID, currentStepType string) map[string]interface{} {
+func (h *RemoteTFEHandler) buildRunDoc(runID string, jobID int, tfeStatus, wsID, currentStepType string, autoApply ...bool) map[string]interface{} {
 	planID := fmt.Sprintf("plan-%d", jobID)
 	applyID := fmt.Sprintf("apply-%d", jobID)
 
 	var hasChanges bool
 	if tfeStatus == "planned" || tfeStatus == "applying" || tfeStatus == "applied" {
 		hasChanges = true
+	}
+
+	aa := false
+	if len(autoApply) > 0 {
+		aa = autoApply[0]
 	}
 
 	return map[string]interface{}{
@@ -577,10 +597,11 @@ func (h *RemoteTFEHandler) buildRunDoc(runID string, jobID int, tfeStatus, wsID,
 				"status":            tfeStatus,
 				"has-changes":       hasChanges,
 				"is-destroy":        strings.Contains(currentStepType, "Destroy"),
+				"auto-apply":        aa,
 				"message":           "",
 				"status-timestamps": map[string]string{},
 				"actions": map[string]interface{}{
-					"is-confirmable": tfeStatus == "planned",
+					"is-confirmable": tfeStatus == "planned" && !aa,
 					"is-discardable": tfeStatus == "planned" || tfeStatus == "pending",
 					"is-cancelable":  tfeStatus == "planning" || tfeStatus == "applying",
 				},
@@ -1012,6 +1033,75 @@ func (h *RemoteTFEHandler) handleConfigVersions(w http.ResponseWriter, r *http.R
 				},
 			},
 		})
+		return
+	}
+
+	http.Error(w, "Not found", http.StatusNotFound)
+}
+
+// ──────────────────────────────────────────────────
+// Account / Organizations stubs for Terraform CLI
+// ──────────────────────────────────────────────────
+
+// handleAccountDetails serves GET /remote/tfe/v2/account/details.
+// The Terraform CLI calls this to verify the token and get the username.
+func (h *RemoteTFEHandler) handleAccountDetails(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Return a minimal account object.  The CLI only needs the id/username fields
+	// to confirm the token is valid — it does not use the other fields for remote ops.
+	doc := map[string]interface{}{
+		"data": map[string]interface{}{
+			"id":   "terrakube-user",
+			"type": "users",
+			"attributes": map[string]interface{}{
+				"username":        "terrakube",
+				"is-service-user": false,
+				"permissions": map[string]bool{
+					"can-create-organizations": false,
+					"can-change-email":         false,
+					"can-change-username":      false,
+				},
+			},
+		},
+	}
+	json.NewEncoder(w).Encode(doc)
+}
+
+// handleOrganizations serves /remote/tfe/v2/organizations/* stubs.
+// Terraform CLI hits the entitlement-set endpoint to check feature flags.
+func (h *RemoteTFEHandler) handleOrganizations(w http.ResponseWriter, r *http.Request, path string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// GET /organizations/{org}/entitlement-set — feature flags used by the CLI
+	if strings.HasSuffix(path, "/entitlement-set") {
+		doc := map[string]interface{}{
+			"data": map[string]interface{}{
+				"id":   "entitlement-set",
+				"type": "entitlement-sets",
+				"attributes": map[string]interface{}{
+					"operations":               true,
+					"private-module-registry":  true,
+					"sentinel":                 false,
+					"state-storage":            true,
+					"teams":                    false,
+					"vcs-integrations":         true,
+					"audit-logging":            false,
+					"agents":                   true,
+					"sso":                      false,
+					"self-serve-billing":       false,
+					"configuration-designer":   false,
+					"cost-estimation":          false,
+					"policy-enforcement-level": false,
+				},
+			},
+		}
+		json.NewEncoder(w).Encode(doc)
 		return
 	}
 
