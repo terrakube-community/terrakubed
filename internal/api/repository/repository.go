@@ -224,15 +224,27 @@ func (r *GenericRepository) List(ctx context.Context, resourceType string, param
 		argIdx++
 	}
 
-	// Additional filters — validate column names to prevent SQL injection
+	// Additional filters — validate column names to prevent SQL injection.
+	// Slice values become IN ($N) clauses; scalar values become = $N.
 	for col, val := range params.Filters {
 		if !isSafeColumnName(col) {
 			log.Printf("List(%s): ignoring filter with unsafe column name %q", resourceType, col)
 			continue
 		}
-		conditions = append(conditions, fmt.Sprintf("%s = $%d", col, argIdx))
-		args = append(args, val)
-		argIdx++
+		switch v := val.(type) {
+		case []string:
+			if len(v) == 0 {
+				continue
+			}
+			// Build "col = ANY($N::text[])" for multi-value IN filter
+			conditions = append(conditions, fmt.Sprintf("%s = ANY($%d::text[])", col, argIdx))
+			args = append(args, v)
+			argIdx++
+		default:
+			conditions = append(conditions, fmt.Sprintf("%s = $%d", col, argIdx))
+			args = append(args, val)
+			argIdx++
+		}
 	}
 
 	if len(conditions) > 0 {
@@ -309,9 +321,19 @@ func (r *GenericRepository) Count(ctx context.Context, resourceType string, para
 		if !isSafeColumnName(col) {
 			continue
 		}
-		conditions = append(conditions, fmt.Sprintf("%s = $%d", col, argIdx))
-		args = append(args, val)
-		argIdx++
+		switch v := val.(type) {
+		case []string:
+			if len(v) == 0 {
+				continue
+			}
+			conditions = append(conditions, fmt.Sprintf("%s = ANY($%d::text[])", col, argIdx))
+			args = append(args, v)
+			argIdx++
+		default:
+			conditions = append(conditions, fmt.Sprintf("%s = $%d", col, argIdx))
+			args = append(args, val)
+			argIdx++
+		}
 	}
 	_ = argIdx
 	if len(conditions) > 0 {

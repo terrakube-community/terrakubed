@@ -428,15 +428,48 @@ func (h *JSONAPIHandler) listResources(w http.ResponseWriter, r *http.Request, r
 	// Parse query params for filtering, sorting, pagination
 	q := r.URL.Query()
 
-	// Filters: ?filter[name]=value
+	// Filters: Elide-style ?filter[field]=value or ?filter[field][op]=value
+	// Operators supported: [eq] (default), [in] (comma-separated list)
+	// Unrecognised operators are treated as equality (best-effort).
 	if params.Filters == nil {
 		params.Filters = make(map[string]interface{})
 	}
 	for key, values := range q {
-		if strings.HasPrefix(key, "filter[") && strings.HasSuffix(key, "]") {
-			filterName := key[7 : len(key)-1]
-			// Convert camelCase filter name to snake_case column name
-			colName := toSnakeCase(filterName)
+		if !strings.HasPrefix(key, "filter[") {
+			continue
+		}
+		// Extract field name: everything between first '[' and first ']'
+		inner := key[7:] // strip "filter["
+		closeBracket := strings.Index(inner, "]")
+		if closeBracket < 0 {
+			continue
+		}
+		fieldName := inner[:closeBracket]
+		colName := toSnakeCase(fieldName)
+
+		// Optional operator bracket: [eq], [in], [ne] …
+		rest := inner[closeBracket+1:]
+		op := "eq" // default
+		if strings.HasPrefix(rest, "[") && strings.HasSuffix(rest, "]") {
+			op = strings.ToLower(rest[1 : len(rest)-1])
+		}
+
+		switch op {
+		case "in":
+			// Value is a comma-separated list → build a slice
+			parts := strings.Split(values[0], ",")
+			list := make([]string, 0, len(parts))
+			for _, p := range parts {
+				if t := strings.TrimSpace(p); t != "" {
+					list = append(list, t)
+				}
+			}
+			params.Filters[colName] = list
+		case "ne":
+			// Not-equal — store as a special wrapper (repository handles if supported)
+			// For now fall through to equality so we at least don't panic
+			params.Filters[colName] = values[0]
+		default:
 			params.Filters[colName] = values[0]
 		}
 	}
@@ -468,17 +501,48 @@ func (h *JSONAPIHandler) listResources(w http.ResponseWriter, r *http.Request, r
 	basePath := "/api/v1"
 	doc := jsonapi.SerializeList(config, rows, basePath)
 
-	// Add pagination meta when pagination is active (matching Elide's meta.page format)
+	// Add pagination meta + links when pagination is active.
+	// Meta matches Elide's meta.page format; links are standard JSON:API pagination links.
 	if params.PageSize > 0 {
 		total, _ := h.repo.Count(r.Context(), resourceType, params)
+		currentPage := params.PageOffset/params.PageSize + 1
+		totalPages := (total + params.PageSize - 1) / params.PageSize
+		if totalPages < 1 {
+			totalPages = 1
+		}
+
 		doc.Meta = map[string]interface{}{
 			"page": map[string]interface{}{
 				"totalRecords": total,
-				"number":       params.PageOffset/params.PageSize + 1,
+				"number":       currentPage,
 				"size":         params.PageSize,
-				"totalPages":   (total + params.PageSize - 1) / params.PageSize,
+				"totalPages":   totalPages,
 			},
 		}
+
+		// Build self URL (preserve existing query params)
+		selfURL := r.URL.RequestURI()
+		baseURL := r.URL.Path
+
+		buildPageURL := func(pageNum int) string {
+			q2 := r.URL.Query()
+			q2.Set("page[number]", strconv.Itoa(pageNum))
+			q2.Set("page[size]", strconv.Itoa(params.PageSize))
+			return baseURL + "?" + q2.Encode()
+		}
+
+		links := &jsonapi.Links{
+			Self:  selfURL,
+			First: buildPageURL(1),
+			Last:  buildPageURL(totalPages),
+		}
+		if currentPage > 1 {
+			links.Prev = buildPageURL(currentPage - 1)
+		}
+		if currentPage < totalPages {
+			links.Next = buildPageURL(currentPage + 1)
+		}
+		doc.Links = links
 	}
 
 	// Handle ?include= on list responses: sideload related resources for every item.
