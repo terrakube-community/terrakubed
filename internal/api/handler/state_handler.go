@@ -464,15 +464,13 @@ func (h *RemoteTFEHandler) createRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Init TCL steps async
-	if defaultTemplate != "" {
-		go func() {
-			proc := tcl.NewProcessor(h.pool)
-			if err := proc.InitJobSteps(context.Background(), jobID); err != nil {
-				log.Printf("TFE createRun: failed to init steps for job %d: %v", jobID, err)
-			}
-		}()
-	}
+	// Init TCL steps async — always (tcl.Processor falls back to defaultPlanTCL when no template)
+	go func() {
+		proc := tcl.NewProcessor(h.pool)
+		if err := proc.InitJobSteps(context.Background(), jobID); err != nil {
+			log.Printf("TFE createRun: failed to init steps for job %d: %v", jobID, err)
+		}
+	}()
 
 	runID := fmt.Sprintf("run-%d", jobID)
 	doc := h.buildRunDoc(runID, jobID, "pending", wsID, "planning")
