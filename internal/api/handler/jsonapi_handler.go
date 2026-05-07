@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -317,15 +318,16 @@ func (h *JSONAPIHandler) handleRelated(w http.ResponseWriter, r *http.Request, p
 			return
 		}
 
-		// Post-create lifecycle hook: initialise TCL steps for new jobs
+		// Post-create lifecycle hook: initialise TCL steps for new jobs.
+		// Run synchronously so steps exist before the scheduler's next poll.
+		// Using context.WithoutCancel so the DB writes aren't aborted when
+		// the HTTP response is flushed and r.Context() is cancelled.
 		if childRel.TargetType == "job" && h.tclProcessor != nil {
 			jobID, _ := strconv.Atoi(fmt.Sprintf("%v", id))
 			if jobID > 0 {
-				go func() {
-					if err := h.tclProcessor.InitJobSteps(r.Context(), jobID); err != nil {
-						log.Printf("TCL step init failed for nested job %d: %v", jobID, err)
-					}
-				}()
+				if err := h.tclProcessor.InitJobSteps(context.WithoutCancel(r.Context()), jobID); err != nil {
+					log.Printf("TCL step init failed for nested job %d: %v", jobID, err)
+				}
 			}
 		}
 
@@ -704,15 +706,15 @@ func (h *JSONAPIHandler) createResource(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// Post-create lifecycle hook: initialise TCL steps for new jobs
+	// Post-create lifecycle hook: initialise TCL steps for new jobs.
+	// Synchronous + WithoutCancel: steps must exist before the scheduler's next
+	// poll, and r.Context() is cancelled as soon as the response is written.
 	if resourceType == "job" && h.tclProcessor != nil {
 		jobID, _ := strconv.Atoi(fmt.Sprintf("%v", id))
 		if jobID > 0 {
-			go func() {
-				if err := h.tclProcessor.InitJobSteps(r.Context(), jobID); err != nil {
-					log.Printf("TCL step init failed for job %d: %v", jobID, err)
-				}
-			}()
+			if err := h.tclProcessor.InitJobSteps(context.WithoutCancel(r.Context()), jobID); err != nil {
+				log.Printf("TCL step init failed for job %d: %v", jobID, err)
+			}
 		}
 	}
 
