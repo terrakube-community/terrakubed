@@ -33,7 +33,12 @@ type JobScheduler struct {
 
 // Executor is the interface for job execution backends.
 type Executor interface {
+	// Execute dispatches a single Terraform step to the backend.
 	Execute(ctx context.Context, execCtx *ExecutionContext) error
+	// CancelJob aborts any running backend resources for the given job ID.
+	// For K8s ephemeral jobs this deletes the Kubernetes Job object; for agents
+	// it is best-effort (the agent detects cancellation via DB poll instead).
+	CancelJob(ctx context.Context, jobID int) error
 }
 
 // ExecutionContext contains everything needed to execute a job.
@@ -74,6 +79,13 @@ func newAgentExecutor(agentURL string) *AgentExecutor {
 		agentURL:   strings.TrimRight(agentURL, "/"),
 		httpClient: &http.Client{Timeout: 15 * time.Second},
 	}
+}
+
+// CancelJob for AgentExecutor is best-effort: the agent pod itself polls the API
+// and will self-terminate when it sees status = 'cancelled'.
+func (a *AgentExecutor) CancelJob(ctx context.Context, jobID int) error {
+	log.Printf("AgentExecutor: cancel signal for job %d sent (agent will detect via DB poll)", jobID)
+	return nil
 }
 
 func (a *AgentExecutor) Execute(ctx context.Context, execCtx *ExecutionContext) error {
@@ -127,6 +139,37 @@ func (s *JobScheduler) Start(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.pollJobs(ctx)
+			s.pollCancels(ctx)
+		}
+	}
+}
+
+// pollCancels finds jobs that were recently cancelled and kills their K8s pods.
+// It looks back 5 minutes so that a cancel that happens between two poll ticks
+// is never missed.  Calling CancelJob on an already-finished job is a no-op
+// (K8s returns "not found", which we silently ignore).
+func (s *JobScheduler) pollCancels(ctx context.Context) {
+	if s.executor == nil {
+		return
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id FROM job
+		WHERE status = 'cancelled'
+		  AND updated_date > NOW() - INTERVAL '5 minutes'
+	`)
+	if err != nil {
+		log.Printf("pollCancels: query error: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var jobID int
+		if err := rows.Scan(&jobID); err != nil {
+			continue
+		}
+		if err := s.executor.CancelJob(ctx, jobID); err != nil {
+			log.Printf("pollCancels: job %d — %v", jobID, err)
 		}
 	}
 }
@@ -615,6 +658,22 @@ func NewEphemeralExecutor(config EphemeralConfig) (*EphemeralExecutor, error) {
 	}
 
 	return &EphemeralExecutor{config: config, clientset: clientset}, nil
+}
+
+// CancelJob deletes all Kubernetes Jobs tagged with terrakube.io/job={jobID}.
+// Deletion is background-propagated so the pod is killed immediately.
+// If no matching jobs exist (already completed / never started) the call is a no-op.
+func (e *EphemeralExecutor) CancelJob(ctx context.Context, jobID int) error {
+	propagation := metav1.DeletePropagationBackground
+	err := e.clientset.BatchV1().Jobs(e.config.Namespace).DeleteCollection(ctx,
+		metav1.DeleteOptions{PropagationPolicy: &propagation},
+		metav1.ListOptions{LabelSelector: fmt.Sprintf("terrakube.io/job=%d", jobID)},
+	)
+	if err != nil {
+		return fmt.Errorf("delete k8s jobs for terrakube job %d: %w", jobID, err)
+	}
+	log.Printf("EphemeralExecutor: k8s jobs for terrakube job %d deleted (or none existed)", jobID)
+	return nil
 }
 
 // Execute creates a Kubernetes Job for the given execution context.

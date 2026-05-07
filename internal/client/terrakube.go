@@ -79,6 +79,40 @@ func (c *TerrakubeClient) CreateHistory(orgId, workspaceId, stateURL string) err
 	return c.post(fmt.Sprintf("/api/v1/organization/%s/workspace/%s/history", orgId, workspaceId), payload)
 }
 
+// GetJobStatus fetches the current status of a job from the API.
+// Used by the executor to detect cancellation during active execution.
+func (c *TerrakubeClient) GetJobStatus(orgId, jobId string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("%s/api/v1/organization/%s/job/%s", c.ApiUrl, orgId, jobId), nil)
+	if err != nil {
+		return "", err
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	resp, err := c.HttpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GetJobStatus returned HTTP %d", resp.StatusCode)
+	}
+
+	var doc struct {
+		Data struct {
+			Attributes struct {
+				Status string `json:"status"`
+			} `json:"attributes"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		return "", fmt.Errorf("failed to decode job status response: %w", err)
+	}
+	return doc.Data.Attributes.Status, nil
+}
+
 func (c *TerrakubeClient) patch(path string, payload interface{}) error {
 	return c.doRequest("PATCH", path, payload)
 }

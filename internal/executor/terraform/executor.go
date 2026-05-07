@@ -77,8 +77,10 @@ func (e *Executor) buildEnvMap() map[string]string {
 
 // runTerraformDirect runs terraform via os/exec to enable color output.
 // terraform-exec hardcodes -no-color, so we bypass it for user-facing commands.
-func (e *Executor) runTerraformDirect(args ...string) error {
-	cmd := exec.Command(e.ExecPath, args...)
+// The context is honoured: cancelling it sends SIGKILL to the Terraform process,
+// which is how we abort active runs when a user cancels a job.
+func (e *Executor) runTerraformDirect(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, e.ExecPath, args...)
 	cmd.Dir = e.WorkingDir
 
 	// Build environment
@@ -100,9 +102,10 @@ func (e *Executor) runTerraformDirect(args ...string) error {
 	return cmd.Run()
 }
 
-func (e *Executor) Execute() (*ExecutionResult, error) {
-	ctx := context.Background()
-
+// Execute runs the Terraform operation described by e.Job.
+// The supplied context controls cancellation: if it is cancelled (e.g. because
+// the user cancelled the job via the API) all Terraform sub-processes are killed.
+func (e *Executor) Execute(ctx context.Context) (*ExecutionResult, error) {
 	if e.Job.ShowHeader && e.Streamer != nil {
 		header := fmt.Sprintf("\n========================================\nRunning %s\n========================================\n", e.Job.Type)
 		e.Streamer.Write([]byte(header))
@@ -110,7 +113,7 @@ func (e *Executor) Execute() (*ExecutionResult, error) {
 
 	// Init with -reconfigure so Terraform adopts the backend override (terrakube_override.tf)
 	// without prompting for state migration, which would fail in non-interactive mode.
-	err := e.runTerraformDirect("init", "-input=false", "-upgrade", "-reconfigure")
+	err := e.runTerraformDirect(ctx, "init", "-input=false", "-upgrade", "-reconfigure")
 	if err != nil {
 		return nil, fmt.Errorf("error running Init: %s", err)
 	}
@@ -125,12 +128,17 @@ func (e *Executor) Execute() (*ExecutionResult, error) {
 	case "terraformApply":
 		err = e.executeApply(ctx)
 	case "terraformDestroy":
-		err = e.executeDestroy()
+		err = e.executeDestroy(ctx)
 	default:
 		return nil, fmt.Errorf("unknown job type: %s", e.Job.Type)
 	}
 
 	if err != nil {
+		// Propagate context cancellation as a distinct error so callers can
+		// distinguish "cancelled by user" from "terraform itself failed".
+		if ctx.Err() != nil {
+			return &ExecutionResult{Success: false, ExitCode: 1}, ctx.Err()
+		}
 		if e.Job.IgnoreError {
 			return &ExecutionResult{Success: true, ExitCode: 0}, nil
 		}
@@ -155,7 +163,7 @@ func (e *Executor) executePlan(ctx context.Context, isDestroy bool) (*ExecutionR
 		args = append(args, "-refresh-only")
 	}
 
-	err := e.runTerraformDirect(args...)
+	err := e.runTerraformDirect(ctx, args...)
 	if err != nil {
 		// Exit code 2 = changes present (not an error for plan)
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -172,22 +180,22 @@ func (e *Executor) executePlan(ctx context.Context, isDestroy bool) (*ExecutionR
 func (e *Executor) executeApply(ctx context.Context) error {
 	planFile := filepath.Join(e.WorkingDir, "terraformLibrary.tfPlan")
 	if _, err := os.Stat(planFile); err == nil {
-		return e.runTerraformDirect("apply", "-input=false", "-auto-approve", planFile)
+		return e.runTerraformDirect(ctx, "apply", "-input=false", "-auto-approve", planFile)
 	}
 
 	args := []string{"apply", "-input=false", "-auto-approve"}
 	if e.Job.Refresh {
 		args = append(args, "-refresh=true")
 	}
-	return e.runTerraformDirect(args...)
+	return e.runTerraformDirect(ctx, args...)
 }
 
-func (e *Executor) executeDestroy() error {
+func (e *Executor) executeDestroy(ctx context.Context) error {
 	args := []string{"destroy", "-input=false", "-auto-approve"}
 	if e.Job.Refresh {
 		args = append(args, "-refresh=true")
 	}
-	return e.runTerraformDirect(args...)
+	return e.runTerraformDirect(ctx, args...)
 }
 
 func (e *Executor) Output() (string, error) {
