@@ -178,6 +178,9 @@ func (h *RemoteTFEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "plans"):
 		h.handlePlans(w, r, path)
 
+	case strings.HasPrefix(path, "applies"):
+		h.handleApplies(w, r, path)
+
 	case strings.HasPrefix(path, "configuration-versions"):
 		h.handleConfigVersions(w, r, path)
 
@@ -561,6 +564,7 @@ func (h *RemoteTFEHandler) getRunPlan(w http.ResponseWriter, r *http.Request, ru
 // buildRunDoc builds a TFE-compatible run response document.
 func (h *RemoteTFEHandler) buildRunDoc(runID string, jobID int, tfeStatus, wsID, currentStepType string) map[string]interface{} {
 	planID := fmt.Sprintf("plan-%d", jobID)
+	applyID := fmt.Sprintf("apply-%d", jobID)
 
 	var hasChanges bool
 	if tfeStatus == "planned" || tfeStatus == "applying" || tfeStatus == "applied" {
@@ -572,10 +576,10 @@ func (h *RemoteTFEHandler) buildRunDoc(runID string, jobID int, tfeStatus, wsID,
 			"id":   runID,
 			"type": "runs",
 			"attributes": map[string]interface{}{
-				"status":       tfeStatus,
-				"has-changes":  hasChanges,
-				"is-destroy":   strings.Contains(currentStepType, "Destroy"),
-				"message":      "",
+				"status":            tfeStatus,
+				"has-changes":       hasChanges,
+				"is-destroy":        strings.Contains(currentStepType, "Destroy"),
+				"message":           "",
 				"status-timestamps": map[string]string{},
 				"actions": map[string]interface{}{
 					"is-confirmable": tfeStatus == "planned",
@@ -583,9 +587,9 @@ func (h *RemoteTFEHandler) buildRunDoc(runID string, jobID int, tfeStatus, wsID,
 					"is-cancelable":  tfeStatus == "planning" || tfeStatus == "applying",
 				},
 				"permissions": map[string]bool{
-					"can-apply":   true,
-					"can-cancel":  true,
-					"can-discard": true,
+					"can-apply":         true,
+					"can-cancel":        true,
+					"can-discard":       true,
 					"can-force-execute": true,
 				},
 			},
@@ -597,6 +601,12 @@ func (h *RemoteTFEHandler) buildRunDoc(runID string, jobID int, tfeStatus, wsID,
 					"data": map[string]interface{}{"id": planID, "type": "plans"},
 					"links": map[string]string{
 						"related": fmt.Sprintf("/remote/tfe/v2/plans/%s", planID),
+					},
+				},
+				"apply": map[string]interface{}{
+					"data": map[string]interface{}{"id": applyID, "type": "applies"},
+					"links": map[string]string{
+						"related": fmt.Sprintf("/remote/tfe/v2/applies/%s", applyID),
 					},
 				},
 			},
@@ -774,6 +784,147 @@ func derefStr(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// handleApplies serves /remote/tfe/v2/applies/* endpoints used by the Terraform CLI
+// to poll apply status and retrieve apply logs.
+//
+//	GET /remote/tfe/v2/applies/{applyId}         → apply status
+//	GET /remote/tfe/v2/applies/{applyId}/logs     → apply log text
+func (h *RemoteTFEHandler) handleApplies(w http.ResponseWriter, r *http.Request, path string) {
+	sub := strings.TrimPrefix(path, "applies")
+	sub = strings.TrimPrefix(sub, "/")
+
+	parts := strings.SplitN(sub, "/", 2)
+	applyID := parts[0]
+	var suffix string
+	if len(parts) == 2 {
+		suffix = parts[1]
+	}
+
+	if applyID == "" {
+		http.Error(w, "apply id required", http.StatusBadRequest)
+		return
+	}
+
+	// apply IDs are "apply-{jobId}" — same encoding as plan IDs
+	jobID, err := parseApplyID(applyID)
+	if err != nil {
+		http.Error(w, "invalid apply id", http.StatusBadRequest)
+		return
+	}
+
+	// GET /applies/{applyId}/logs — serve apply log
+	if r.Method == http.MethodGet && suffix == "logs" {
+		h.getApplyLog(w, r, jobID)
+		return
+	}
+
+	// GET /applies/{applyId} — return apply status
+	if r.Method == http.MethodGet {
+		h.writeApplyDoc(w, r.Context(), applyID, jobID)
+		return
+	}
+
+	http.Error(w, "Not found", http.StatusNotFound)
+}
+
+// writeApplyDoc writes a TFE apply response.
+func (h *RemoteTFEHandler) writeApplyDoc(w http.ResponseWriter, ctx context.Context, applyID string, jobID int) {
+	var jobStatus string
+	err := h.pool.QueryRow(ctx,
+		"SELECT status FROM job WHERE id = $1", jobID,
+	).Scan(&jobStatus)
+	if err != nil {
+		http.Error(w, "apply not found", http.StatusNotFound)
+		return
+	}
+
+	// Look up the apply step (last terraform step after plan)
+	var applyStepStatus string
+	_ = h.pool.QueryRow(ctx,
+		`SELECT status FROM step WHERE job_id = $1 AND step_number > 100
+		 ORDER BY step_number ASC LIMIT 1`,
+		jobID,
+	).Scan(&applyStepStatus)
+
+	applyStatus := "pending"
+	switch applyStepStatus {
+	case "running":
+		applyStatus = "running"
+	case "completed":
+		applyStatus = "finished"
+	case "failed":
+		applyStatus = "errored"
+	case "":
+		// No apply step yet — derive from job status
+		switch jobStatus {
+		case "completed":
+			applyStatus = "finished"
+		case "failed":
+			applyStatus = "errored"
+		case "running":
+			applyStatus = "running"
+		}
+	}
+
+	logReadURL := fmt.Sprintf("https://%s/remote/tfe/v2/applies/%s/logs", h.hostname, applyID)
+
+	doc := map[string]interface{}{
+		"data": map[string]interface{}{
+			"id":   applyID,
+			"type": "applies",
+			"attributes": map[string]interface{}{
+				"status":                applyStatus,
+				"log-read-url":          logReadURL,
+				"resource-additions":    0,
+				"resource-changes":      0,
+				"resource-destructions": 0,
+			},
+			"links": map[string]string{
+				"self": fmt.Sprintf("/remote/tfe/v2/applies/%s", applyID),
+			},
+		},
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(doc)
+}
+
+// getApplyLog serves the apply step log from Redis or storage.
+func (h *RemoteTFEHandler) getApplyLog(w http.ResponseWriter, r *http.Request, jobID int) {
+	// Find the apply step (step_number > 100, which is after the plan step at 100)
+	var stepID, orgID, wsID string
+	err := h.pool.QueryRow(r.Context(), `
+		SELECT s.id::text, j.organization_id::text, j.workspace_id::text
+		FROM step s JOIN job j ON s.job_id = j.id
+		WHERE s.job_id = $1 AND s.step_number > 100
+		ORDER BY s.step_number ASC LIMIT 1
+	`, jobID).Scan(&stepID, &orgID, &wsID)
+	if err != nil {
+		// No apply step yet — return empty
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	remotePath := fmt.Sprintf("tfplan/%d/terraformapply/%s.txt", jobID, stepID)
+	reader, err := h.storage.DownloadFile(remotePath)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	defer reader.Close()
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	io.Copy(w, reader)
+}
+
+// parseApplyID extracts the numeric job ID from "apply-{jobId}" or plain "{jobId}".
+func parseApplyID(applyID string) (int, error) {
+	s := strings.TrimPrefix(applyID, "apply-")
+	return strconv.Atoi(s)
 }
 
 func (h *RemoteTFEHandler) handleConfigVersions(w http.ResponseWriter, r *http.Request, path string) {
