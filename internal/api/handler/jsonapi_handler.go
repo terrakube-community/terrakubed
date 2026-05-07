@@ -758,7 +758,7 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 	if resourceType == "job" && h.pool != nil {
 		if newStatus, ok := data["status"].(string); ok {
 			switch newStatus {
-			case "completed", "failed", "noChanges", "rejected":
+			case "completed", "failed", "noChanges", "rejected", "cancelled":
 				// Unlock the workspace when a job reaches any terminal state.
 				// The executor K8s pod updates job status directly via API; the scheduler
 				// doesn't see terminal-state jobs in its poll loop so workspace unlock

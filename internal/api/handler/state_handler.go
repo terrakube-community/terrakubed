@@ -571,8 +571,12 @@ func (h *RemoteTFEHandler) discardRun(w http.ResponseWriter, r *http.Request, ru
 	h.pool.Exec(r.Context(), "UPDATE step SET status = 'rejected' WHERE job_id = $1 AND status = 'waitingApproval'", jobID)
 	h.pool.Exec(r.Context(), "UPDATE step SET status = 'notExecuted' WHERE job_id = $1 AND status = 'pending'", jobID)
 	h.pool.Exec(r.Context(), "UPDATE job SET status = 'cancelled' WHERE id = $1", jobID)
+	// Unlock the workspace so future runs are not blocked
+	h.pool.Exec(r.Context(),
+		`UPDATE workspace SET locked = false, last_job_status = 'cancelled', last_job_date = NOW()
+		 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID)
 
-	log.Printf("TFE: run %s (job %d) discarded", runID, jobID)
+	log.Printf("TFE: run %s (job %d) discarded — workspace unlocked", runID, jobID)
 	w.WriteHeader(http.StatusOK)
 }
 
