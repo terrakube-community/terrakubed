@@ -255,13 +255,21 @@ func (h *TeamTokenHandler) getPermissions(w http.ResponseWriter, r *http.Request
 	parts := strings.Split(strings.TrimPrefix(path, "/permissions/organization/"), "/")
 	orgID := parts[0]
 
+	var wsID string
+	if len(parts) >= 3 && parts[1] == "workspace" {
+		wsID = parts[2]
+	}
+
 	// Get user's groups from context (set by AuthMiddleware)
 	groups := make([]string, 0)
 	isOwner := false
+	userEmail := "unknown"
 	if user := middleware.GetUser(r.Context()); user != nil {
+		userEmail = user.Email
 		// Service accounts get full permissions
 		if user.IsServiceAccount() {
 			isOwner = true
+			log.Printf("[permissions] service account %q → isOwner=true (orgID=%s wsID=%s)", userEmail, orgID, wsID)
 		} else {
 			for _, g := range user.Groups {
 				groups = append(groups, strings.TrimSpace(g))
@@ -269,7 +277,11 @@ func (h *TeamTokenHandler) getPermissions(w http.ResponseWriter, r *http.Request
 					isOwner = true
 				}
 			}
+			log.Printf("[permissions] user=%q groups=%v ownerGroup=%q isOwner=%v orgID=%s wsID=%s",
+				userEmail, groups, h.ownerGroup, isOwner, orgID, wsID)
 		}
+	} else {
+		log.Printf("[permissions] no user in context (unauthenticated?) orgID=%s wsID=%s", orgID, wsID)
 	}
 
 	// Start with the same 8 flags as the Java API.
@@ -289,6 +301,7 @@ func (h *TeamTokenHandler) getPermissions(w http.ResponseWriter, r *http.Request
 	if !isOwner {
 		// Query team permissions from DB (same logic as Java API)
 		h.loadTeamPermissions(r.Context(), orgID, groups, permissions)
+		log.Printf("[permissions] after team lookup: %v", permissions)
 	}
 
 	// Owner-only extended flags: only add these when isOwner=true.
@@ -306,18 +319,23 @@ func (h *TeamTokenHandler) getPermissions(w http.ResponseWriter, r *http.Request
 	}
 
 	// If workspace ID is provided, also check workspace-level access
-	if len(parts) >= 3 && parts[1] == "workspace" {
-		wsID := parts[2]
+	if wsID != "" {
 		h.loadWorkspacePermissions(r.Context(), wsID, groups, permissions)
+		log.Printf("[permissions] after workspace lookup (wsID=%s): %v", wsID, permissions)
 	}
+
+	log.Printf("[permissions] final response for user=%q orgID=%s wsID=%s: %v", userEmail, orgID, wsID, permissions)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(permissions)
+	if err := json.NewEncoder(w).Encode(permissions); err != nil {
+		log.Printf("[permissions] ERROR encoding response: %v", err)
+	}
 }
 
 func (h *TeamTokenHandler) loadTeamPermissions(ctx context.Context, orgID string, groups []string, permissions map[string]bool) {
 	if len(groups) == 0 {
+		log.Printf("[permissions] loadTeamPermissions: no groups, skipping DB query")
 		return
 	}
 
@@ -334,18 +352,25 @@ func (h *TeamTokenHandler) loadTeamPermissions(ctx context.Context, orgID string
 		FROM team WHERE organization_id = $1 AND name IN (%s)`,
 		strings.Join(placeholders, ","))
 
+	log.Printf("[permissions] loadTeamPermissions: querying DB orgID=%s groups=%v", orgID, groups)
+
 	rows, err := h.pool.Query(ctx, query, args...)
 	if err != nil {
-		log.Printf("Failed to load team permissions: %v", err)
+		log.Printf("[permissions] loadTeamPermissions: DB query error: %v", err)
 		return
 	}
 	defer rows.Close()
 
+	rowCount := 0
 	for rows.Next() {
+		rowCount++
 		var ms, mw, mm, mp, mv, mt, mc, mj bool
 		if err := rows.Scan(&ms, &mw, &mm, &mp, &mv, &mt, &mc, &mj); err != nil {
+			log.Printf("[permissions] loadTeamPermissions: scan error: %v", err)
 			continue
 		}
+		log.Printf("[permissions] loadTeamPermissions: row %d → state=%v ws=%v mod=%v prov=%v vcs=%v tpl=%v coll=%v job=%v",
+			rowCount, ms, mw, mm, mp, mv, mt, mc, mj)
 		permissions["manageState"] = permissions["manageState"] || ms
 		permissions["manageWorkspace"] = permissions["manageWorkspace"] || mw
 		permissions["manageModule"] = permissions["manageModule"] || mm
@@ -355,6 +380,7 @@ func (h *TeamTokenHandler) loadTeamPermissions(ctx context.Context, orgID string
 		permissions["manageCollection"] = permissions["manageCollection"] || mc
 		permissions["manageJob"] = permissions["manageJob"] || mj
 	}
+	log.Printf("[permissions] loadTeamPermissions: matched %d team row(s) for orgID=%s", rowCount, orgID)
 }
 
 func (h *TeamTokenHandler) loadWorkspacePermissions(ctx context.Context, wsID string, groups []string, permissions map[string]bool) {
