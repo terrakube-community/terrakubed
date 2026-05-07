@@ -311,6 +311,12 @@ func (h *GraphQLHandler) executeMutation(r *http.Request, query string, variable
 
 	meta, _ := h.repo.GetMeta(rootType)
 
+	// Normalise mutation data keys: the UI sends camelCase field names
+	// (e.g. "organizationId", "terraformVersion") but the repository and DB
+	// expect snake_case column names. Convert all keys here so that downstream
+	// code (Create / Update) always gets a consistent snake_case map.
+	data = normalizeDataKeys(data, meta)
+
 	switch strings.ToUpper(op) {
 	case "UPSERT":
 		id, _ := data["id"].(string)
@@ -916,6 +922,36 @@ func snakeToCamel(s string) string {
 		}
 	}
 	return strings.Join(parts, "")
+}
+
+// normalizeDataKeys converts the keys of a mutation data map from camelCase to
+// snake_case so they match DB column names. If meta is provided, we validate
+// each converted key against the registered columns; unknown keys are dropped
+// to prevent injection of arbitrary column names. Already-snake_case keys
+// (e.g. audit fields added by setGQLAuditCreate) are passed through unchanged.
+func normalizeDataKeys(data map[string]interface{}, meta *repository.ResourceMeta) map[string]interface{} {
+	if len(data) == 0 {
+		return data
+	}
+	// Build allowed-column set from meta
+	allowed := make(map[string]bool)
+	if meta != nil {
+		for _, col := range meta.Columns {
+			allowed[col] = true
+		}
+	}
+
+	out := make(map[string]interface{}, len(data))
+	for k, v := range data {
+		snake := camelToSnake(k)
+		if meta != nil && !allowed[snake] && !allowed[k] {
+			// Neither camelCase nor snake_case form is a known column — drop it
+			continue
+		}
+		// Use snake_case form (it already equals k when key was snake_case)
+		out[snake] = v
+	}
+	return out
 }
 
 // camelToSnake converts camelCase to snake_case: "terraformVersion" → "terraform_version"
