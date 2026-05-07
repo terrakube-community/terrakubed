@@ -392,11 +392,14 @@ func (s *JobScheduler) maybeCompleteJob(ctx context.Context, jobID int) {
 		s.pool.Exec(ctx, "UPDATE job SET status = $1 WHERE id = $2", finalStatus, jobID)
 		log.Printf("Job %d %s", jobID, finalStatus)
 
-		// Unlock the workspace now the run is complete
+		// Unlock the workspace and update run metadata visible in the UI
 		s.pool.Exec(ctx, `
-			UPDATE workspace SET locked = false
+			UPDATE workspace SET
+			  locked = false,
+			  last_job_status = $2,
+			  last_job_date = NOW()
 			WHERE id = (SELECT workspace_id FROM job WHERE id = $1)
-		`, jobID)
+		`, jobID, finalStatus)
 
 		// Post commit status back to VCS provider (async, best-effort)
 		go s.postCommitStatus(ctx, jobID, finalStatus)
