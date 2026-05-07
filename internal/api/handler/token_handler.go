@@ -272,8 +272,10 @@ func (h *TeamTokenHandler) getPermissions(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Start with the same 8 flags as the Java API.
+	// For owners (and service accounts) all flags are true immediately.
+	// For regular users they are populated from the team DB records below.
 	permissions := map[string]bool{
-		// Core manage flags (checked by workspace details page and newer UI settings pages)
 		"manageState":      isOwner,
 		"manageWorkspace":  isOwner,
 		"manageModule":     isOwner,
@@ -282,19 +284,25 @@ func (h *TeamTokenHandler) getPermissions(w http.ResponseWriter, r *http.Request
 		"manageTemplate":   isOwner,
 		"manageCollection": isOwner,
 		"manageJob":        isOwner,
-		// Extended flags expected by newer UI versions for Settings page create buttons.
-		// These are owner-only operations: creating teams, global vars, agents, federated creds, etc.
-		"manageTeam":       isOwner,
-		"manageGlobalVar":  isOwner,
-		"manageAgent":      isOwner,
-		"manageFederated":  isOwner,
-		"manageAccess":     isOwner,
-		"manageSsh":        isOwner,
 	}
 
 	if !isOwner {
-		// Query team permissions from DB
+		// Query team permissions from DB (same logic as Java API)
 		h.loadTeamPermissions(r.Context(), orgID, groups, permissions)
+	}
+
+	// Owner-only extended flags: only add these when isOwner=true.
+	// When the user is NOT an owner we deliberately omit them (returning undefined
+	// to the UI, not false) — this matches the Java API behaviour where these
+	// flags were never returned at all. Returning explicit false would cause the
+	// newer UI to disable Settings create-buttons even when manageWorkspace=true.
+	if isOwner {
+		permissions["manageTeam"] = true
+		permissions["manageGlobalVar"] = true
+		permissions["manageAgent"] = true
+		permissions["manageFederated"] = true
+		permissions["manageAccess"] = true
+		permissions["manageSsh"] = true
 	}
 
 	// If workspace ID is provided, also check workspace-level access
