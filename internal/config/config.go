@@ -219,7 +219,16 @@ func LoadConfig() (*Config, error) {
 		DatabaseURL:   buildDatabaseURL(),
 		Hostname:      getEnvWithFallback("TERRAKUBE_HOSTNAME", "TerrakubeHostname"),
 		ApiPort:       getEnv("API_PORT", "8080"),
-		OwnerGroup:    getEnvWithFallback("TERRAKUBE_OWNER", "TerrakubeOwner"),
+		// Java API equivalent: ${TERRAKUBE_OWNER:TerrakubeOwner}
+		// Try TERRAKUBE_OWNER first, then TerrakubeOwner env var, then hardcoded default.
+		// getEnvWithFallback treats the second arg as another env var name (not a value),
+		// so we need an explicit hardcoded fallback to match Java API's behaviour.
+		OwnerGroup: func() string {
+			if v := getEnvWithFallback("TERRAKUBE_OWNER", "TerrakubeOwner"); v != "" {
+				return v
+			}
+			return "TerrakubeOwner"
+		}(),
 		RedisAddress:  buildRedisAddress(),
 		RedisPassword: getEnvChain("TerrakubeRedisPassword", "REDIS_PASSWORD"),
 
