@@ -794,16 +794,12 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	// Reload and return
-	row, err := h.repo.FindByID(r.Context(), resourceType, id)
-	if err != nil || row == nil {
-		writeError(w, http.StatusInternalServerError, "Updated but failed to reload")
-		return
-	}
-
-	basePath := "/api/v1"
-	doc := jsonapi.SerializeSingle(config, row, basePath)
-	writeJSON(w, http.StatusOK, doc)
+	// JSON:API spec §7.2: a successful PATCH may return either
+	//   200 OK  (with the full updated document), or
+	//   204 No Content (no body).
+	// The Terrakube UI checks for 204 explicitly, so we follow that convention.
+	// The executor only checks for a 2xx status code, so 204 is safe for it too.
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *JSONAPIHandler) deleteResource(w http.ResponseWriter, r *http.Request, resourceType string, id interface{}) {
