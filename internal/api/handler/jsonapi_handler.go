@@ -765,31 +765,24 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 				// The executor K8s pod updates job status directly via API; the scheduler
 				// doesn't see terminal-state jobs in its poll loop so workspace unlock
 				// must happen here instead.
-				// Also update workspace.last_job_status / last_job_date for the UI.
+				// NOTE: we intentionally do NOT write last_job_status — the Java API
+				// reads that column as a numeric byte, so writing string values crashes it.
 				go func(jobID interface{}, status string) {
 					ctx := r.Context()
 					_, err := h.pool.Exec(ctx,
 						`UPDATE workspace SET
 						   locked = false,
-						   last_job_status = $2,
 						   last_job_date = NOW()
 						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`,
-						jobID, status)
+						jobID)
 					if err != nil {
-						log.Printf("Failed to unlock/update workspace for job %v: %v", jobID, err)
+						log.Printf("Failed to unlock workspace for job %v: %v", jobID, err)
 					} else {
-						log.Printf("Job %v terminal state %q — workspace unlocked, last_job_status updated", jobID, status)
+						log.Printf("Job %v terminal state %q — workspace unlocked", jobID, status)
 					}
 				}(id, newStatus)
 			case "running":
-				// Update last_job_status to "running" so the UI shows the workspace as active
-				go func(jobID interface{}) {
-					ctx := r.Context()
-					_, _ = h.pool.Exec(ctx,
-						`UPDATE workspace SET last_job_status = 'running'
-						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`,
-						jobID)
-				}(id)
+				// no workspace column update needed for running state
 			}
 		}
 	}

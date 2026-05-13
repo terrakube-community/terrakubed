@@ -108,7 +108,7 @@ func (h *ApprovalHandler) reject(w http.ResponseWriter, r *http.Request, jobID s
 
 	// Unlock the workspace — the JSONAPI hook won't fire here since we update via direct SQL
 	h.pool.Exec(ctx,
-		`UPDATE workspace SET locked = false, last_job_status = 'rejected', last_job_date = NOW()
+		`UPDATE workspace SET locked = false, last_job_date = NOW()
 		 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID)
 
 	log.Printf("Job %s rejected — workspace unlocked", jobID)
