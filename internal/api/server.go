@@ -137,6 +137,10 @@ func NewServer(config Config) (*Server, error) {
 		w.Write([]byte(`{"data":[],"meta":{"page":{"totalRecords":0,"number":1,"totalPages":1,"limit":10}}}`))
 	})
 
+	// JSON:API Atomic Operations (https://jsonapi.org/ext/atomic/)
+	// POST /operations — used by the UI for workspace create/update.
+	mux.HandleFunc("/operations", jsonapiHandler.HandleOperations)
+
 	// JSON:API CRUD endpoints
 	mux.Handle("/api/v1/", jsonapiHandler)
 
