@@ -102,6 +102,9 @@ func (h *JSONAPIHandler) buildConfigs() {
 			}
 		}
 
+		// Copy virtual/computed attribute config from ResourceMeta.
+		config.VirtualJSON = meta.VirtualJSON
+
 		h.configs[typeName] = config
 	}
 }
@@ -500,6 +503,13 @@ func (h *JSONAPIHandler) listResources(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
+	// Call EnrichRow for computed/virtual attributes (e.g. registryPath on module).
+	if meta, ok := h.repo.GetMeta(resourceType); ok && meta.EnrichRow != nil {
+		for _, row := range rows {
+			meta.EnrichRow(r.Context(), h.pool, row)
+		}
+	}
+
 	basePath := "/api/v1"
 	doc := jsonapi.SerializeList(config, rows, basePath)
 
@@ -618,6 +628,11 @@ func (h *JSONAPIHandler) getResource(w http.ResponseWriter, r *http.Request, res
 	if row == nil {
 		writeError(w, http.StatusNotFound, "Resource not found")
 		return
+	}
+
+	// Call EnrichRow for computed/virtual attributes (e.g. registryPath on module).
+	if meta, ok := h.repo.GetMeta(resourceType); ok && meta.EnrichRow != nil {
+		meta.EnrichRow(r.Context(), h.pool, row)
 	}
 
 	basePath := "/api/v1"

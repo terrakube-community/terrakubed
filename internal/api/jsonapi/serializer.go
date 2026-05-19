@@ -105,6 +105,11 @@ type ResourceConfig struct {
 	Columns    []ColumnMapping
 	ParentRels map[string]ParentRelConfig // relationship name → config
 	ChildRels  map[string]ChildRelConfig  // relationship name → config
+
+	// VirtualJSON maps JSON:API attribute names → row-map keys written by EnrichRow
+	// (called by the handler before Serialize). These virtual attributes are included
+	// in the response alongside the regular DB-column attributes.
+	VirtualJSON map[string]string
 }
 
 // ParentRelConfig describes a parent (to-one) relationship.
@@ -142,6 +147,13 @@ func Serialize(config *ResourceConfig, row map[string]interface{}, basePath stri
 			continue
 		}
 		res.Attributes[col.JSONAttribute] = formatValue(val)
+	}
+
+	// Set virtual/computed attributes (populated by EnrichRow in the handler).
+	for jsonAttr, rowKey := range config.VirtualJSON {
+		if val, ok := row[rowKey]; ok && val != nil {
+			res.Attributes[jsonAttr] = formatValue(val)
+		}
 	}
 
 	// Set parent relationships (to-one)

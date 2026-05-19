@@ -41,6 +41,15 @@ type ResourceMeta struct {
 	// Used for variable.value and globalvar.value when sensitive = true.
 	SensitiveFlagColumn  string
 	SensitiveMaskColumns []string
+
+	// EnrichRow, if set, is called for each row after it is fetched from the DB.
+	// The function may add computed/virtual keys to the row map (e.g. by querying
+	// related tables). The pool is passed so the function can run sub-queries.
+	EnrichRow func(ctx context.Context, pool *pgxpool.Pool, row map[string]interface{})
+
+	// VirtualJSON maps JSON:API attribute names to the row-map keys populated by EnrichRow.
+	// These virtual attributes are serialized into the response alongside the DB columns.
+	VirtualJSON map[string]string // jsonAttributeName → row map key
 }
 
 // ParentRelation describes a ManyToOne/OneToOne FK relationship.

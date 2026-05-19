@@ -1,8 +1,10 @@
 package registry
 
 import (
+	"context"
 	"reflect"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/terrakube-community/terrakubed/internal/api/model"
 	"github.com/terrakube-community/terrakubed/internal/api/repository"
 )
@@ -180,6 +182,21 @@ func RegisterAll(repo *repository.GenericRepository) {
 		Children: map[string]repository.ChildRelation{
 			"version": {ChildType: "module_version", FKColumn: "module_id"},
 		},
+		// Computed attribute: registryPath = orgName/moduleName/provider
+		// Java API equivalent: @ComputedAttribute getRegistryPath() in Module.java
+		// The UI uses this to construct the readme and download URLs:
+		//   /terraform/readme/v1/{registryPath}/v{version}/download
+		EnrichRow: func(ctx context.Context, pool *pgxpool.Pool, row map[string]interface{}) {
+			orgID, _ := row["organization_id"]
+			name, _ := row["name"].(string)
+			provider, _ := row["provider"].(string)
+			var orgName string
+			if orgID != nil {
+				pool.QueryRow(ctx, "SELECT name FROM organization WHERE id = $1", orgID).Scan(&orgName)
+			}
+			row["_registry_path"] = orgName + "/" + name + "/" + provider
+		},
+		VirtualJSON: map[string]string{"registryPath": "_registry_path"},
 	})
 
 	repo.Register(&repository.ResourceMeta{
