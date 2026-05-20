@@ -109,8 +109,8 @@ func (p *Processor) InitJobSteps(ctx context.Context, jobID int) error {
 			name = fmt.Sprintf("Running Step %d", flow.Step)
 		}
 		_, err := p.pool.Exec(ctx,
-			`INSERT INTO step (id, step_number, name, status, output, log_status, job_id)
-			 VALUES ($1, $2, $3, 'pending', '', 'pending', $4)`,
+			`INSERT INTO step (id, step_number, name, status, output, job_id)
+			 VALUES ($1, $2, $3, 'pending', '', $4)`,
 			stepID, flow.Step, name, jobID,
 		)
 		if err != nil {

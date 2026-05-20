@@ -349,11 +349,17 @@ func (h *JSONAPIHandler) handleRelated(w http.ResponseWriter, r *http.Request, p
 }
 
 // ──────────────────────────────────────────────────
-// Relationship link: GET /api/v1/{type}/{id}/relationships/{rel}
+// Relationship link: GET/PATCH /api/v1/{type}/{id}/relationships/{rel}
 // ──────────────────────────────────────────────────
 
 func (h *JSONAPIHandler) handleRelationshipLink(w http.ResponseWriter, r *http.Request, resourceType, idStr, relName string) {
-	if r.Method != http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
+		// handled below
+	case http.MethodPatch:
+		h.patchRelationshipLink(w, r, resourceType, idStr, relName)
+		return
+	default:
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
@@ -423,6 +429,319 @@ func (h *JSONAPIHandler) handleRelationshipLink(w http.ResponseWriter, r *http.R
 	}
 
 	writeError(w, http.StatusNotFound, fmt.Sprintf("Unknown relationship: %s", relName))
+}
+
+// patchRelationshipLink handles PATCH /api/v1/{type}/{id}/relationships/{rel}.
+// Supports to-one relationships: body is { "data": { "type": "...", "id": "..." } | null }.
+// Used by the UI to update FK relationships (e.g. workspace→agent, workspace→vcs).
+func (h *JSONAPIHandler) patchRelationshipLink(w http.ResponseWriter, r *http.Request, resourceType, idStr, relName string) {
+	config, ok := h.configs[resourceType]
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Unknown resource type: %s", resourceType))
+		return
+	}
+
+	id, err := parseID(idStr, h.repo, resourceType)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Only support to-one (parent) relationship updates for now
+	parentRel, ok := config.ParentRels[relName]
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Unknown or unsupported relationship: %s", relName))
+		return
+	}
+
+	// Parse body: { "data": { "type": "...", "id": "..." } | null }
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Failed to read body")
+		return
+	}
+	defer r.Body.Close()
+
+	var payload struct {
+		Data *jsonapi.ResourceIdentifier `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+
+	var newFKVal interface{}
+	if payload.Data != nil {
+		newFKVal = payload.Data.ID
+	}
+
+	if err := h.repo.Update(r.Context(), resourceType, id, map[string]interface{}{
+		parentRel.FKColumn: newFKVal,
+	}); err != nil {
+		log.Printf("Error patching relationship %s.%s for %v: %v", resourceType, relName, id, err)
+		writeError(w, http.StatusInternalServerError, "Failed to update relationship")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ──────────────────────────────────────────────────
+// Atomic Operations: POST /operations
+// JSON:API Atomic Operations extension (https://jsonapi.org/ext/atomic/)
+// The Terrakube UI uses this for workspace create/update.
+// ──────────────────────────────────────────────────
+
+// atomicOperation represents a single operation in an atomic:operations request.
+type atomicOperation struct {
+	Op   string                 `json:"op"`   // "add", "update", "remove"
+	Href string                 `json:"href"` // resource URL, e.g. /organization/{id}/workspace/{id}
+	Data jsonapi.RequestResource `json:"data"`
+}
+
+// atomicOperationsRequest is the request body for POST /operations.
+type atomicOperationsRequest struct {
+	Operations []atomicOperation `json:"atomic:operations"`
+}
+
+// atomicOperationsResponse is the response body for POST /operations.
+type atomicOperationsResponse struct {
+	AtomicResults []interface{} `json:"atomic:results"`
+}
+
+// HandleOperations processes POST /operations (JSON:API Atomic Operations extension).
+// It executes each operation sequentially and returns results.
+func (h *JSONAPIHandler) HandleOperations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.api+json")
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Failed to read body")
+		return
+	}
+	defer r.Body.Close()
+
+	var req atomicOperationsRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid JSON: "+err.Error())
+		return
+	}
+
+	results := make([]interface{}, 0, len(req.Operations))
+
+	for _, op := range req.Operations {
+		result, httpStatus, opErr := h.executeAtomicOp(r, op)
+		if opErr != nil {
+			log.Printf("Atomic operation %s %s failed: %v", op.Op, op.Href, opErr)
+			w.WriteHeader(httpStatus)
+			json.NewEncoder(w).Encode(jsonapi.ErrorDocument{
+				Errors: []jsonapi.Error{{
+					Status: fmt.Sprintf("%d", httpStatus),
+					Title:  "Operation failed",
+					Detail: opErr.Error(),
+				}},
+			})
+			return
+		}
+		// JSON:API atomic results: each entry is either null (for updates/removes)
+		// or { "data": Resource } (for adds). The UI accesses [0].data.id.
+		if result != nil {
+			results = append(results, map[string]interface{}{"data": result})
+		} else {
+			results = append(results, nil)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, atomicOperationsResponse{AtomicResults: results})
+}
+
+// executeAtomicOp executes a single atomic operation and returns the result resource,
+// the HTTP status code (for errors), and any error.
+func (h *JSONAPIHandler) executeAtomicOp(r *http.Request, op atomicOperation) (interface{}, int, error) {
+	// Parse href to determine resource type and optional ID.
+	// hrefs look like: /organization/{id}/workspace/{id} or /api/v1/workspace/{id}
+	href := strings.TrimPrefix(op.Href, "/api/v1")
+	segments := strings.Split(strings.Trim(href, "/"), "/")
+
+	// Walk path segments to extract:
+	//   parentFKs:    map of FK column name → value from the URL path context
+	//   resourceType: last type segment
+	//   resourceID:   last id segment (if present)
+	parentFKs := make(map[string]string)
+	var resourceType string
+	var resourceID string
+
+	for i := 0; i+1 < len(segments); i += 2 {
+		segType := segments[i]
+		segID := segments[i+1]
+		if h.isKnownType(segType) {
+			// Last known type/id pair becomes the resource
+			if i+2 < len(segments) {
+				// intermediate: record as parent FK for the next type
+				nextType := ""
+				if i+2 < len(segments) {
+					nextType = segments[i+2]
+				}
+				if nextType != "" {
+					if cfg, ok := h.configs[nextType]; ok {
+						if parentRel, ok := cfg.ParentRels[segType]; ok {
+							parentFKs[parentRel.FKColumn] = segID
+						}
+					}
+				}
+			}
+			resourceType = segType
+			resourceID = segID
+		}
+	}
+	// Handle odd-length paths: last segment is resource type only (add without ID in path)
+	if len(segments)%2 == 1 {
+		last := segments[len(segments)-1]
+		if h.isKnownType(last) {
+			resourceType = last
+			resourceID = ""
+		}
+		// Second-to-last pair is the parent context
+		if len(segments) >= 3 {
+			parentSegType := segments[len(segments)-3]
+			parentSegID := segments[len(segments)-2]
+			if cfg, ok := h.configs[resourceType]; ok {
+				if parentRel, ok := cfg.ParentRels[parentSegType]; ok {
+					parentFKs[parentRel.FKColumn] = parentSegID
+				}
+			}
+		}
+	}
+
+	// Fall back to data.type if href parsing gives nothing useful
+	if resourceType == "" || !h.isKnownType(resourceType) {
+		if op.Data.Type != "" && h.isKnownType(op.Data.Type) {
+			resourceType = op.Data.Type
+		} else {
+			return nil, http.StatusBadRequest, fmt.Errorf("cannot determine resource type from href %q or data.type %q", op.Href, op.Data.Type)
+		}
+	}
+
+	config, ok := h.configs[resourceType]
+	if !ok {
+		return nil, http.StatusNotFound, fmt.Errorf("unknown resource type: %s", resourceType)
+	}
+
+	switch strings.ToLower(op.Op) {
+	case "add":
+		return h.atomicAdd(r, resourceType, config, op, parentFKs)
+	case "update":
+		id := resourceID
+		if id == "" {
+			id = op.Data.ID
+		}
+		if id == "" {
+			return nil, http.StatusBadRequest, fmt.Errorf("update operation requires resource ID")
+		}
+		return h.atomicUpdate(r, resourceType, config, id, op)
+	case "remove":
+		id := resourceID
+		if id == "" {
+			id = op.Data.ID
+		}
+		if id == "" {
+			return nil, http.StatusBadRequest, fmt.Errorf("remove operation requires resource ID")
+		}
+		return h.atomicRemove(r, resourceType, id)
+	default:
+		return nil, http.StatusBadRequest, fmt.Errorf("unsupported operation: %s", op.Op)
+	}
+}
+
+func (h *JSONAPIHandler) isKnownType(t string) bool {
+	_, ok := h.configs[t]
+	return ok
+}
+
+func (h *JSONAPIHandler) atomicAdd(r *http.Request, resourceType string, config *jsonapi.ResourceConfig, op atomicOperation, parentFKs map[string]string) (interface{}, int, error) {
+	meta, _ := h.repo.GetMeta(resourceType)
+	data := jsonapi.Deserialize(config, op.Data)
+
+	// Inject parent FK values extracted from the href path
+	for fkCol, fkVal := range parentFKs {
+		if _, exists := data[fkCol]; !exists {
+			data[fkCol] = fkVal
+		}
+	}
+
+	if meta != nil && meta.PKType == "uuid" {
+		if _, ok := data[meta.PKColumn]; !ok {
+			data[meta.PKColumn] = uuid.New().String()
+		}
+	}
+	setAuditCreate(data, r, meta)
+
+	id, err := h.repo.Create(r.Context(), resourceType, data)
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+
+	// Post-create lifecycle hooks
+	if resourceType == "job" && h.tclProcessor != nil {
+		if jobID, err2 := strconv.Atoi(fmt.Sprintf("%v", id)); err2 == nil && jobID > 0 {
+			if err2 := h.tclProcessor.InitJobSteps(context.WithoutCancel(r.Context()), jobID); err2 != nil {
+				log.Printf("Atomic add: TCL step init failed for job %d: %v", jobID, err2)
+			}
+		}
+	}
+
+	row, err := h.repo.FindByID(r.Context(), resourceType, id)
+	if err != nil || row == nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("created but failed to reload")
+	}
+	return jsonapi.Serialize(config, row, "/api/v1"), http.StatusOK, nil
+}
+
+func (h *JSONAPIHandler) atomicUpdate(r *http.Request, resourceType string, config *jsonapi.ResourceConfig, idStr string, op atomicOperation) (interface{}, int, error) {
+	id, err := parseID(idStr, h.repo, resourceType)
+	if err != nil {
+		return nil, http.StatusBadRequest, err
+	}
+
+	meta, _ := h.repo.GetMeta(resourceType)
+	data := jsonapi.Deserialize(config, op.Data)
+	setAuditUpdate(data, r, meta)
+
+	if err := h.repo.Update(r.Context(), resourceType, id, data); err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+
+	// Post-update lifecycle hooks (same as regular PATCH)
+	if resourceType == "job" && h.pool != nil {
+		if newStatus, ok := data["status"].(string); ok {
+			switch newStatus {
+			case "completed", "failed", "noChanges", "rejected", "cancelled":
+				go func(jobID interface{}, status string) {
+					h.pool.Exec(context.Background(),
+						`UPDATE workspace SET locked = false, last_job_date = NOW()
+						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID)
+				}(id, newStatus)
+			}
+		}
+	}
+
+	// Return null result for updates (JSON:API atomic ops spec allows null)
+	return nil, 0, nil
+}
+
+func (h *JSONAPIHandler) atomicRemove(r *http.Request, resourceType string, idStr string) (interface{}, int, error) {
+	id, err := parseID(idStr, h.repo, resourceType)
+	if err != nil {
+		return nil, http.StatusBadRequest, err
+	}
+	if err := h.repo.Delete(r.Context(), resourceType, id); err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	return nil, 0, nil
 }
 
 // ──────────────────────────────────────────────────
