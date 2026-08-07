@@ -9,6 +9,7 @@ import (
 	api "github.com/terrakube-community/terrakubed/internal/api"
 	"github.com/terrakube-community/terrakubed/internal/config"
 	"github.com/terrakube-community/terrakubed/internal/executor"
+	"github.com/terrakube-community/terrakubed/internal/executor/terraform"
 	"github.com/terrakube-community/terrakubed/internal/registry"
 )
 
@@ -62,6 +63,8 @@ func main() {
 			defer wg.Done()
 			startExecutor(cfg)
 		}()
+	case "install-terraform":
+		installTerraform(cfg)
 	case "all":
 		wg.Add(3)
 		go func() {
@@ -77,10 +80,32 @@ func main() {
 			startExecutor(cfg)
 		}()
 	default:
-		log.Fatalf("Unknown SERVICE_TYPE: %s. Supported values are: api, registry, executor, all", serviceType)
+		log.Fatalf("Unknown SERVICE_TYPE: %s. Supported values are: api, registry, executor, install-terraform, all", serviceType)
 	}
 
 	wg.Wait()
+}
+
+// installTerraform downloads (or confirms the cached presence of) the
+// Terraform/OpenTofu version requested by the job's EphemeralJobData, then
+// exits. Used as the executor Job's init container so the download happens
+// on a volume shared with, but not part of, the executor container's own
+// writable layer — the executor container then just execs the already
+// in-place binary instead of dropping and running a freshly fetched one
+// itself, which is what a "new binary written and executed" runtime
+// detection (e.g. Falco) would otherwise flag.
+func installTerraform(cfg *config.Config) {
+	if cfg.EphemeralJobData == nil {
+		log.Fatal("install-terraform requires EphemeralJobData/EPHEMERAL_JOB_DATA")
+	}
+
+	vm := terraform.NewVersionManager()
+	execPath, err := vm.Install(cfg.EphemeralJobData.TerraformVersion, cfg.EphemeralJobData.Tofu)
+	if err != nil {
+		log.Fatalf("Failed to install terraform %s: %v", cfg.EphemeralJobData.TerraformVersion, err)
+	}
+
+	log.Printf("Terraform ready at: %s", execPath)
 }
 
 func startAPI(cfg *config.Config) {

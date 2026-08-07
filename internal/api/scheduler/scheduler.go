@@ -691,6 +691,15 @@ func (e *EphemeralExecutor) Execute(ctx context.Context, execCtx *ExecutionConte
 	backoff := int32(0)
 	privileged := false
 
+	// Terraform/OpenTofu binaries are installed by the init container below
+	// into this shared, ephemeral volume rather than by the executor
+	// container itself. That keeps the "download and execute a new binary"
+	// step off the executor container's own writable layer, so runtime
+	// security monitoring on the executor container doesn't see what would
+	// otherwise look identical to a dropped-and-run malicious binary.
+	const terraformCacheVolumeName = "terraform-cache"
+	const terraformCacheMountPath = "/root/.terrakube/terraform-versions"
+
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
@@ -720,6 +729,44 @@ func (e *EphemeralExecutor) Execute(ctx context.Context, execCtx *ExecutionConte
 					RestartPolicy:      corev1.RestartPolicyNever,
 					NodeSelector:       e.config.NodeSelector,
 					Tolerations:        e.buildTolerations(),
+					Volumes: []corev1.Volume{
+						{
+							Name: terraformCacheVolumeName,
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+					},
+					InitContainers: []corev1.Container{
+						{
+							Name:            "terraform-installer",
+							Image:           e.config.Image,
+							ImagePullPolicy: corev1.PullAlways,
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: &privileged,
+							},
+							Env: []corev1.EnvVar{
+								{
+									Name:  "EphemeralJobData",
+									Value: execB64,
+								},
+								{
+									Name:  "SERVICE_TYPE",
+									Value: "install-terraform",
+								},
+							},
+							// No EnvFrom here deliberately: this container only needs
+							// to know which Terraform/OpenTofu version to fetch, not
+							// the VCS/storage/registry credentials the executor
+							// container gets via e.config.SecretName.
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      terraformCacheVolumeName,
+									MountPath: terraformCacheMountPath,
+								},
+							},
+						},
+					},
 					Containers: []corev1.Container{
 						{
 							Name:            "executor",
@@ -735,6 +782,12 @@ func (e *EphemeralExecutor) Execute(ctx context.Context, execCtx *ExecutionConte
 								},
 							},
 							EnvFrom: e.buildEnvFrom(),
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      terraformCacheVolumeName,
+									MountPath: terraformCacheMountPath,
+								},
+							},
 						},
 					},
 				},
