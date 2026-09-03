@@ -35,6 +35,22 @@ type Config struct {
 	RedisAddress   string
 	RedisPassword  string
 
+	// Storage backend credentials/location (only the fields matching
+	// StorageType are used). Mirrors internal/registry/server.go's storage
+	// init — the API server needs these too since it reads/writes Terraform
+	// state and plan/apply logs directly, not just the registry.
+	AwsRegion                 string
+	AwsBucketName             string
+	AwsAccessKey              string
+	AwsSecretKey              string
+	AwsEndpoint               string
+	AzureStorageAccountName   string
+	AzureStorageAccountKey    string
+	AzureStorageContainerName string
+	GcpStorageProjectId       string
+	GcpStorageBucketName      string
+	GcpStorageCredentials     string
+
 	// Kubernetes executor config
 	ExecutorNamespace      string
 	ExecutorImage          string
@@ -76,8 +92,43 @@ func NewServer(config Config) (*Server, error) {
 	// Create custom handlers (Redis wired in after Redis client is created)
 	logsHandler := handler.NewLogsHandler(repo)
 
-	// Create storage service
-	storageService, err := storage.NewStorageService(config.StorageType)
+	// Create storage service.
+	// storage.NewStorageService(type) alone can't construct AWS/Azure/GCP
+	// backends — it has no credentials/bucket/region to work with and always
+	// errors for those types (see its own comments), silently degrading every
+	// deployment using cloud storage to NopStorageService: state reads/writes
+	// and plan/apply log persistence all fail. Mirrors the switch in
+	// internal/registry/server.go, which already does this correctly.
+	var storageService storage.StorageService
+	switch config.StorageType {
+	case "AWS", "AwsStorageImpl":
+		storageService, err = storage.NewAWSStorageService(
+			ctx,
+			config.AwsRegion,
+			config.AwsBucketName,
+			config.Hostname,
+			config.AwsEndpoint,
+			config.AwsAccessKey,
+			config.AwsSecretKey,
+		)
+	case "AZURE", "AzureStorageImpl":
+		storageService, err = storage.NewAzureStorageService(
+			config.AzureStorageAccountName,
+			config.AzureStorageAccountKey,
+			config.AzureStorageContainerName,
+			config.Hostname,
+		)
+	case "GCP", "GcpStorageImpl":
+		storageService, err = storage.NewGCPStorageService(
+			ctx,
+			config.GcpStorageProjectId,
+			config.GcpStorageBucketName,
+			config.GcpStorageCredentials,
+			config.Hostname,
+		)
+	default:
+		storageService = &storage.NopStorageService{}
+	}
 	if err != nil {
 		log.Printf("Warning: storage service not available (%v), using nop", err)
 		storageService = &storage.NopStorageService{}

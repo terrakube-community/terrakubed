@@ -232,21 +232,26 @@ func LoadConfig() (*Config, error) {
 		RedisAddress:  buildRedisAddress(),
 		RedisPassword: getEnvChain("TerrakubeRedisPassword", "REDIS_PASSWORD"),
 
-		// Kubernetes executor
-		// Java API equivalent: io.terrakube.executor.ephemeral.namespace=${ExecutorEphemeralNamespace:terrakube}
-		// — a hardcoded "terrakube" fallback baked into application.properties.
-		// getEnvChain alone returns "" when unset, and an empty namespace makes
-		// the K8s client treat Job creation as a cluster-scoped request, which
-		// the deployment's namespaced RBAC Role then rejects with "forbidden ...
-		// at the cluster scope" — every job fails instantly with no logs.
+		// Kubernetes executor.
+		// The Helm chart sets these as literal container env vars using Java's
+		// exact Spring property names — io.terrakube.executor.ephemeral.namespace
+		// reads ${ExecutorEphemeralNamespace:terrakube}, .image reads
+		// ${ExecutorEphemeralImage:...}, .secret reads ${ExecutorEphemeralSecret:...}.
+		// These must be the FIRST names checked: a previous fix here added a
+		// hardcoded "terrakube" fallback for namespace that happened to match
+		// the deployment's real value by coincidence — it was never actually
+		// reading ExecutorEphemeralNamespace, so the equivalent gap for Image
+		// (no safe hardcoded fallback exists — Java's default is its own old
+		// executor image, wrong for terrakubed) surfaced as a hard failure:
+		// "spec.template.spec.containers[0].image: Required value".
 		ExecutorNamespace: func() string {
-			if v := getEnvChain("EXECUTOR_NAMESPACE", "TerrakubeExecutorNamespace"); v != "" {
+			if v := getEnvChain("ExecutorEphemeralNamespace", "EXECUTOR_NAMESPACE", "TerrakubeExecutorNamespace"); v != "" {
 				return v
 			}
 			return "terrakube"
 		}(),
-		ExecutorImage:          getEnvChain("EXECUTOR_IMAGE", "TerrakubeExecutorImage", "AzBuilderRegistry"),
-		ExecutorSecretName:     getEnvChain("EXECUTOR_SECRET_NAME", "TerrakubeExecutorSecret"),
+		ExecutorImage:          getEnvChain("ExecutorEphemeralImage", "EXECUTOR_IMAGE", "TerrakubeExecutorImage", "AzBuilderRegistry"),
+		ExecutorSecretName:     getEnvChain("ExecutorEphemeralSecret", "EXECUTOR_SECRET_NAME", "TerrakubeExecutorSecret"),
 		ExecutorServiceAccount: getEnvChain("EXECUTOR_SERVICE_ACCOUNT", "TerrakubeExecutorServiceAccount"),
 	}
 
