@@ -79,8 +79,15 @@ func RegisterAll(repo *repository.GenericRepository) {
 			"address": {ChildType: "address", FKColumn: "job_id"},
 		},
 		DefaultValues: map[string]interface{}{
-			"status":       "pending",
-			"tcl":          "{}",
+			"status": "pending",
+			// NOTE: do NOT default "tcl" here. InitJobSteps() treats a non-empty
+			// tcl as "already resolved" and skips template lookup entirely; a
+			// placeholder like "{}" also isn't valid base64, so parseTCL() fails
+			// and zero step rows get created — the job then completes instantly
+			// on the scheduler's first poll (no pending steps found). Leaving tcl
+			// unset (NULL in the DB, "" via COALESCE) lets InitJobSteps correctly
+			// resolve it from the job's template_reference, or fall back to the
+			// default single-step plan flow.
 			"refresh":      true,
 			"refresh_only": false,
 			"plan_changes": true,
