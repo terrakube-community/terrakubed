@@ -304,25 +304,30 @@ func (h *TeamTokenHandler) getPermissions(w http.ResponseWriter, r *http.Request
 		log.Printf("[permissions] after team lookup: %v", permissions)
 	}
 
-	// Owner-only extended flags: only add these when isOwner=true.
-	// When the user is NOT an owner we deliberately omit them (returning undefined
-	// to the UI, not false) — this matches the Java API behaviour where these
-	// flags were never returned at all. Returning explicit false would cause the
-	// newer UI to disable Settings create-buttons even when manageWorkspace=true.
-	if isOwner {
-		permissions["manageTeam"] = true
-		permissions["manageGlobalVar"] = true
-		permissions["manageAgent"] = true
-		permissions["manageFederated"] = true
-		permissions["manageAccess"] = true
-		permissions["manageSsh"] = true
-	}
-
 	// If workspace ID is provided, also check workspace-level access
 	if wsID != "" {
 		h.loadWorkspacePermissions(r.Context(), wsID, groups, permissions)
 		log.Printf("[permissions] after workspace lookup (wsID=%s): %v", wsID, permissions)
 	}
+
+	// The current Terrakube UI (RBAC v2) reads three additional fields that the
+	// legacy 8-flag PermissionSet never had: planJob, approveJob, managePermission.
+	// managePermission gates entire admin-only Settings pages (Teams, General,
+	// Global Variables, Agents, Federated Credentials, Actions) — omitting it
+	// makes the UI default every such button to disabled, even for a fully
+	// permissioned user, since `response.data.managePermission ?? false` always
+	// resolves to false when the key is absent.
+	//
+	// Real Java semantics: managePermission = OR of canManageWorkspace(team) across
+	// the user's teams, forced true if the user is in the instance-owner group.
+	// planJob/approveJob are new team-level grants (plan_job/approve_job columns)
+	// that supersede the legacy manage_job boolean; until those columns are read
+	// here, mirror manage_job for both — this exactly matches how Java itself
+	// backfilled plan_job/approve_job from manage_job when RBAC v2 was introduced,
+	// so it's a safe, always-correct default regardless of migration state.
+	permissions["planJob"] = permissions["manageJob"]
+	permissions["approveJob"] = permissions["manageJob"]
+	permissions["managePermission"] = permissions["manageWorkspace"] || isOwner
 
 	log.Printf("[permissions] final response for user=%q orgID=%s wsID=%s: %v", userEmail, orgID, wsID, permissions)
 

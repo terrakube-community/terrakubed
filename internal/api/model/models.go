@@ -202,7 +202,13 @@ type Team struct {
 	ManageProvider   bool      `json:"manageProvider"  db:"manage_provider"`
 	ManageVcs        bool      `json:"manageVcs"       db:"manage_vcs"`
 	ManageTemplate   bool      `json:"manageTemplate"  db:"manage_template"`
-	OrganizationID   uuid.UUID `json:"organizationId"  db:"organization_id"`
+	// RBAC v2 (present only on deployments migrated to it; ValidateColumns()
+	// silently drops these at startup on older schemas, so registering them
+	// unconditionally here is safe).
+	Role           string    `json:"role"       db:"role"`
+	PlanJob        bool      `json:"planJob"    db:"plan_job"`
+	ApproveJob     bool      `json:"approveJob" db:"approve_job"`
+	OrganizationID uuid.UUID `json:"organizationId"  db:"organization_id"`
 }
 
 // Template — table "template"
@@ -398,7 +404,11 @@ type Access struct {
 	ManageState     bool      `json:"manageState"     db:"manage_state"`
 	ManageJob       bool      `json:"manageJob"       db:"manage_job"`
 	ManageWorkspace bool      `json:"manageWorkspace" db:"manage_workspace"`
-	WorkspaceID     uuid.UUID `json:"workspaceId"     db:"workspace_id"`
+	// RBAC v2 (see Team.Role for the ValidateColumns() safety-net note).
+	Role        string    `json:"role"       db:"role"`
+	PlanJob     bool      `json:"planJob"    db:"plan_job"`
+	ApproveJob  bool      `json:"approveJob" db:"approve_job"`
+	WorkspaceID uuid.UUID `json:"workspaceId"     db:"workspace_id"`
 }
 
 // Content — table "content"
