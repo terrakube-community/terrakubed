@@ -84,6 +84,15 @@ func getEnvChain(keys ...string) string {
 }
 
 func getStorageType() string {
+	// Java API equivalent: io.terrakube.storage.type=${StorageType} — the Helm
+	// chart sets this exact env var name (PascalCase, no underscore). Checking
+	// only STORAGE_TYPE/TerraformStateType meant it was never actually read,
+	// silently resolving to "LOCAL" and degrading every cloud-storage
+	// deployment to NopStorageService regardless of the api.Config storage
+	// wiring — state reads/writes and plan/apply log persistence all fail.
+	if st := os.Getenv("StorageType"); st != "" {
+		return st
+	}
 	st := os.Getenv("STORAGE_TYPE")
 	if st != "" {
 		return st
