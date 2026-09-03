@@ -126,6 +126,20 @@ func startAPI(cfg *config.Config) {
 		RedisAddress:   cfg.RedisAddress,
 		RedisPassword:  cfg.RedisPassword,
 
+		// Storage backend credentials/location (see api.Config's own comment —
+		// only the fields matching StorageType are actually used)
+		AwsRegion:                 cfg.AwsRegion,
+		AwsBucketName:             cfg.AwsBucketName,
+		AwsAccessKey:              cfg.AwsAccessKey,
+		AwsSecretKey:              cfg.AwsSecretKey,
+		AwsEndpoint:               cfg.AwsEndpoint,
+		AzureStorageAccountName:   cfg.AzureStorageAccountName,
+		AzureStorageAccountKey:    cfg.AzureStorageAccountKey,
+		AzureStorageContainerName: cfg.AzureStorageContainerName,
+		GcpStorageProjectId:       cfg.GcpStorageProjectId,
+		GcpStorageBucketName:      cfg.GcpStorageBucketName,
+		GcpStorageCredentials:     cfg.GcpStorageCredentials,
+
 		// Kubernetes executor (used by Go API job scheduler)
 		ExecutorNamespace:      cfg.ExecutorNamespace,
 		ExecutorImage:          cfg.ExecutorImage,
