@@ -272,6 +272,16 @@ func RegisterAll(repo *repository.GenericRepository) {
 		Children:             map[string]repository.ChildRelation{},
 		SensitiveFlagColumn:  "sensitive",
 		SensitiveMaskColumns: []string{"variable_value"},
+		// The UI's "sensitive"/"hcl" fields are Ant Design <Switch> inputs bound
+		// via valuePropName="checked" with no initialValue — when left untouched
+		// (the common case for "hcl") the form omits the key entirely rather than
+		// sending false, so the column is left out of the INSERT and falls
+		// through to whatever the DB column allows. sensitive is a NOT NULL
+		// boolean with no DB default, so an omitted "sensitive" 500s the create.
+		DefaultValues: map[string]interface{}{
+			"sensitive": false,
+			"hcl":       false,
+		},
 	})
 
 	repo.Register(&repository.ResourceMeta{
@@ -286,6 +296,13 @@ func RegisterAll(repo *repository.GenericRepository) {
 		Children:             map[string]repository.ChildRelation{},
 		SensitiveFlagColumn:  "sensitive",
 		SensitiveMaskColumns: []string{"variable_value"},
+		// Both sensitive and hcl are NOT NULL booleans with no DB default (see
+		// changelog-2.4.0.xml) — see the "variable" registration above for why
+		// the create form can omit them entirely.
+		DefaultValues: map[string]interface{}{
+			"sensitive": false,
+			"hcl":       false,
+		},
 	})
 
 	// ── Workspace sub-entities ─────────────────────
