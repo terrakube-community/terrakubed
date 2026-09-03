@@ -1093,6 +1093,22 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 	// Post-update lifecycle hooks
 	if resourceType == "job" && h.pool != nil {
 		if newStatus, ok := data["status"].(string); ok {
+			if newStatus == "cancelled" {
+				// Cancelling a job only ever set job.status — nothing updated the
+				// step(s) still sitting in pending/running/waitingApproval, so the
+				// UI (which renders each step's own status, not the job's) kept
+				// showing "Plan running" with a spinner forever even though the
+				// job itself correctly showed "cancelled". Run this synchronously
+				// (unlike the workspace-unlock goroutine below) since it's cheap
+				// and completes well before the handler returns — r.Context() is
+				// safe to use here.
+				if _, err := h.pool.Exec(r.Context(),
+					`UPDATE step SET status = 'cancelled'
+					 WHERE job_id = $1 AND status IN ('pending', 'running', 'waitingApproval')`,
+					id); err != nil {
+					log.Printf("Failed to cancel steps for job %v: %v", id, err)
+				}
+			}
 			switch newStatus {
 			case "completed", "failed", "noChanges", "rejected", "cancelled":
 				// Unlock the workspace when a job reaches any terminal state.
