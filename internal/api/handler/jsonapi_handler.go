@@ -1102,8 +1102,14 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 				// NOTE: we intentionally do NOT write last_job_status — the Java API
 				// reads that column as a numeric byte, so writing string values crashes it.
 				go func(jobID interface{}, status string) {
-					ctx := r.Context()
-					_, err := h.pool.Exec(ctx,
+					// context.Background(), not r.Context(): this goroutine outlives the
+					// HTTP handler (which returns right after firing it and writes the
+					// response), and net/http cancels the request context as soon as
+					// ServeHTTP returns. Using r.Context() here meant this UPDATE almost
+					// always ran against an already-cancelled context and failed
+					// silently — the client got its 204 "cancelled successfully" while
+					// the workspace stayed locked forever underneath.
+					_, err := h.pool.Exec(context.Background(),
 						`UPDATE workspace SET
 						   locked = false,
 						   last_job_date = NOW()
