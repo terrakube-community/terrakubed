@@ -233,7 +233,18 @@ func LoadConfig() (*Config, error) {
 		RedisPassword: getEnvChain("TerrakubeRedisPassword", "REDIS_PASSWORD"),
 
 		// Kubernetes executor
-		ExecutorNamespace:      getEnvChain("EXECUTOR_NAMESPACE", "TerrakubeExecutorNamespace"),
+		// Java API equivalent: io.terrakube.executor.ephemeral.namespace=${ExecutorEphemeralNamespace:terrakube}
+		// — a hardcoded "terrakube" fallback baked into application.properties.
+		// getEnvChain alone returns "" when unset, and an empty namespace makes
+		// the K8s client treat Job creation as a cluster-scoped request, which
+		// the deployment's namespaced RBAC Role then rejects with "forbidden ...
+		// at the cluster scope" — every job fails instantly with no logs.
+		ExecutorNamespace: func() string {
+			if v := getEnvChain("EXECUTOR_NAMESPACE", "TerrakubeExecutorNamespace"); v != "" {
+				return v
+			}
+			return "terrakube"
+		}(),
 		ExecutorImage:          getEnvChain("EXECUTOR_IMAGE", "TerrakubeExecutorImage", "AzBuilderRegistry"),
 		ExecutorSecretName:     getEnvChain("EXECUTOR_SECRET_NAME", "TerrakubeExecutorSecret"),
 		ExecutorServiceAccount: getEnvChain("EXECUTOR_SERVICE_ACCOUNT", "TerrakubeExecutorServiceAccount"),
