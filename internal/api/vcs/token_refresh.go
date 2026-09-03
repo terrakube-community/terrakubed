@@ -58,7 +58,7 @@ func (r *TokenRefresher) refreshExpiring(ctx context.Context) {
 		FROM vcs
 		WHERE refresh_token IS NOT NULL AND refresh_token != ''
 		  AND (token_expiration IS NULL OR token_expiration < NOW() + INTERVAL '30 minutes')
-		  AND status = 'ACTIVE'
+		  AND status = 'COMPLETED'
 	`)
 	if err != nil {
 		log.Printf("TokenRefresher: query error: %v", err)
