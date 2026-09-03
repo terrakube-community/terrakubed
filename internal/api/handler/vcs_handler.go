@@ -78,13 +78,13 @@ func (h *VCSCallbackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Store the token
 	if expiry.IsZero() {
 		_, err = h.pool.Exec(r.Context(), `
-			UPDATE vcs SET access_token = $1, refresh_token = $2, status = 'ACTIVE'
+			UPDATE vcs SET access_token = $1, refresh_token = $2, status = 'COMPLETED'
 			WHERE id = $3
 		`, accessToken, refreshToken, vcsID)
 	} else {
 		_, err = h.pool.Exec(r.Context(), `
 			UPDATE vcs SET access_token = $1, refresh_token = $2,
-			               token_expiration = $3, status = 'ACTIVE'
+			               token_expiration = $3, status = 'COMPLETED'
 			WHERE id = $4
 		`, accessToken, refreshToken, expiry, vcsID)
 	}
