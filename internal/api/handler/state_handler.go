@@ -65,24 +65,29 @@ func (h *TerraformStateHandler) getState(w http.ResponseWriter, r *http.Request,
 	log.Printf("Get state: org=%s ws=%s file=%s", orgID, wsID, stateFile)
 
 	// Read from storage backend.
-	// Try the exact filename first (new uploads use .json), then fall back to
-	// .tfstate for state files uploaded by older versions of the API.
-	storagePath := fmt.Sprintf("tfstate/%s/%s/%s", orgID, wsID, stateFile)
+	// Java's AwsStorageTypeServiceImpl uses two distinct, non-interchangeable
+	// key shapes (see BUCKET_STATE_JSON / getCurrentTerraformState):
+	//   - the canonical "current state" pointer (no history id) lives at the
+	//     workspace root:      tfstate/{org}/{ws}/terraform.tfstate
+	//   - a specific historical version lives one level deeper, under state/:
+	//     tfstate/{org}/{ws}/state/{historyId}.json
+	// This previously omitted the "state/" segment for historical lookups,
+	// so every version-specific download 404'd even for objects that were
+	// genuinely uploaded (by Java, or — before this fix — even by our own
+	// upload handler, which had the same wrong shape and so at least
+	// round-tripped with itself, just never matched what Java actually wrote
+	// or expects to read).
+	var storagePath string
+	if stateFile == "terraform.tfstate" {
+		storagePath = fmt.Sprintf("tfstate/%s/%s/terraform.tfstate", orgID, wsID)
+	} else {
+		storagePath = fmt.Sprintf("tfstate/%s/%s/state/%s", orgID, wsID, stateFile)
+	}
 	reader, err := h.storage.DownloadFile(storagePath)
 	if err != nil {
-		// Fallback: swap extension (.json ↔ .tfstate) for historical files
-		alt := storagePath
-		if strings.HasSuffix(storagePath, ".json") {
-			alt = strings.TrimSuffix(storagePath, ".json") + ".tfstate"
-		} else if strings.HasSuffix(storagePath, ".tfstate") {
-			alt = strings.TrimSuffix(storagePath, ".tfstate") + ".json"
-		}
-		reader, err = h.storage.DownloadFile(alt)
-		if err != nil {
-			log.Printf("Error reading state (tried %s and %s): %v", storagePath, alt, err)
-			http.Error(w, "State not found", http.StatusNotFound)
-			return
-		}
+		log.Printf("Error reading state (%s): %v", storagePath, err)
+		http.Error(w, "State not found", http.StatusNotFound)
+		return
 	}
 	defer reader.Close()
 
@@ -125,13 +130,20 @@ func (h *TerraformStateHandler) uploadHostedState(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Upload to storage backend.
-	// Use .json extension to match the download URL (state/{historyId}.json).
-	storagePath := fmt.Sprintf("tfstate/%s/%s/%s.json", orgID, wsID, historyID)
-	if err := h.storage.UploadFile(storagePath, bytes.NewReader(body)); err != nil {
+	// Upload to storage backend, matching Java's AwsStorageTypeServiceImpl key
+	// shapes exactly (see the comment in getState above): the historyId-keyed
+	// copy lives under state/, and the canonical "current state" pointer
+	// (read by any client asking for terraform.tfstate with no history id)
+	// lives at the workspace root and always reflects the latest push.
+	historyPath := fmt.Sprintf("tfstate/%s/%s/state/%s.json", orgID, wsID, historyID)
+	if err := h.storage.UploadFile(historyPath, bytes.NewReader(body)); err != nil {
 		log.Printf("Error uploading state to storage: %v", err)
 		http.Error(w, "Failed to upload state", http.StatusInternalServerError)
 		return
+	}
+	currentPath := fmt.Sprintf("tfstate/%s/%s/terraform.tfstate", orgID, wsID)
+	if err := h.storage.UploadFile(currentPath, bytes.NewReader(body)); err != nil {
+		log.Printf("Error uploading current state pointer to storage: %v", err)
 	}
 	log.Printf("Upload state: org=%s ws=%s history=%s (%d bytes)", orgID, wsID, historyID, len(body))
 
