@@ -663,15 +663,28 @@ func NewEphemeralExecutor(config EphemeralConfig) (*EphemeralExecutor, error) {
 // Deletion is background-propagated so the pod is killed immediately.
 // If no matching jobs exist (already completed / never started) the call is a no-op.
 func (e *EphemeralExecutor) CancelJob(ctx context.Context, jobID int) error {
-	propagation := metav1.DeletePropagationBackground
-	err := e.clientset.BatchV1().Jobs(e.config.Namespace).DeleteCollection(ctx,
-		metav1.DeleteOptions{PropagationPolicy: &propagation},
-		metav1.ListOptions{LabelSelector: fmt.Sprintf("terrakube.io/job=%d", jobID)},
-	)
+	// List + delete-by-name instead of DeleteCollection: DeleteCollection
+	// requires the separate "deletecollection" RBAC verb, which this
+	// ServiceAccount's Role doesn't grant (only get/list/watch/create/update/
+	// patch/delete on batch/jobs) — every cancel silently failed to ever
+	// remove the K8s Job, retrying forever ("jobs.batch is forbidden ...
+	// cannot deletecollection resource"). list+delete only needs verbs the
+	// Role already has.
+	jobsClient := e.clientset.BatchV1().Jobs(e.config.Namespace)
+	list, err := jobsClient.List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("terrakube.io/job=%d", jobID),
+	})
 	if err != nil {
-		return fmt.Errorf("delete k8s jobs for terrakube job %d: %w", jobID, err)
+		return fmt.Errorf("list k8s jobs for terrakube job %d: %w", jobID, err)
 	}
-	log.Printf("EphemeralExecutor: k8s jobs for terrakube job %d deleted (or none existed)", jobID)
+
+	propagation := metav1.DeletePropagationBackground
+	for _, kJob := range list.Items {
+		if err := jobsClient.Delete(ctx, kJob.Name, metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil {
+			return fmt.Errorf("delete k8s job %s for terrakube job %d: %w", kJob.Name, jobID, err)
+		}
+	}
+	log.Printf("EphemeralExecutor: k8s jobs for terrakube job %d deleted (%d found)", jobID, len(list.Items))
 	return nil
 }
 
