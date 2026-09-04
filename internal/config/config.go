@@ -259,9 +259,23 @@ func LoadConfig() (*Config, error) {
 			}
 			return "terrakube"
 		}(),
-		ExecutorImage:          getEnvChain("ExecutorEphemeralImage", "EXECUTOR_IMAGE", "TerrakubeExecutorImage", "AzBuilderRegistry"),
-		ExecutorSecretName:     getEnvChain("ExecutorEphemeralSecret", "EXECUTOR_SECRET_NAME", "TerrakubeExecutorSecret"),
-		ExecutorServiceAccount: getEnvChain("EXECUTOR_SERVICE_ACCOUNT", "TerrakubeExecutorServiceAccount"),
+		ExecutorImage:      getEnvChain("ExecutorEphemeralImage", "EXECUTOR_IMAGE", "TerrakubeExecutorImage", "AzBuilderRegistry"),
+		ExecutorSecretName: getEnvChain("ExecutorEphemeralSecret", "EXECUTOR_SECRET_NAME", "TerrakubeExecutorSecret"),
+		// An empty ServiceAccountName on the ephemeral Job pod spec makes
+		// Kubernetes fall back to the namespace's "default" ServiceAccount,
+		// which the Helm chart never annotates with an IAM role (only the
+		// "terrakube" ServiceAccount — the same one api/registry/executor run
+		// as — carries eks.amazonaws.com/role-arn). Every executor pod then had
+		// no AWS credentials at all: Terraform's S3 backend failed with "no EC2
+		// IMDS role found", and even our own log/state uploads failed the exact
+		// same way. Default to the chart's standard ServiceAccount name so a
+		// deployment that hasn't set this explicitly still gets IRSA.
+		ExecutorServiceAccount: func() string {
+			if v := getEnvChain("EXECUTOR_SERVICE_ACCOUNT", "TerrakubeExecutorServiceAccount"); v != "" {
+				return v
+			}
+			return "terrakube"
+		}(),
 	}
 
 	// Override API / Secret if provided by executor envs
