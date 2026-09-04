@@ -1093,6 +1093,22 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 	// Post-update lifecycle hooks
 	if resourceType == "job" && h.pool != nil {
 		if newStatus, ok := data["status"].(string); ok {
+			if newStatus == "cancelled" {
+				// Cancelling a job only ever set job.status — nothing updated the
+				// step(s) still sitting in pending/running/waitingApproval, so the
+				// UI (which renders each step's own status, not the job's) kept
+				// showing "Plan running" with a spinner forever even though the
+				// job itself correctly showed "cancelled". Run this synchronously
+				// (unlike the workspace-unlock goroutine below) since it's cheap
+				// and completes well before the handler returns — r.Context() is
+				// safe to use here.
+				if _, err := h.pool.Exec(r.Context(),
+					`UPDATE step SET status = 'cancelled'
+					 WHERE job_id = $1 AND status IN ('pending', 'running', 'waitingApproval')`,
+					id); err != nil {
+					log.Printf("Failed to cancel steps for job %v: %v", id, err)
+				}
+			}
 			switch newStatus {
 			case "completed", "failed", "noChanges", "rejected", "cancelled":
 				// Unlock the workspace when a job reaches any terminal state.
@@ -1102,8 +1118,14 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 				// NOTE: we intentionally do NOT write last_job_status — the Java API
 				// reads that column as a numeric byte, so writing string values crashes it.
 				go func(jobID interface{}, status string) {
-					ctx := r.Context()
-					_, err := h.pool.Exec(ctx,
+					// context.Background(), not r.Context(): this goroutine outlives the
+					// HTTP handler (which returns right after firing it and writes the
+					// response), and net/http cancels the request context as soon as
+					// ServeHTTP returns. Using r.Context() here meant this UPDATE almost
+					// always ran against an already-cancelled context and failed
+					// silently — the client got its 204 "cancelled successfully" while
+					// the workspace stayed locked forever underneath.
+					_, err := h.pool.Exec(context.Background(),
 						`UPDATE workspace SET
 						   locked = false,
 						   last_job_date = NOW()

@@ -1,0 +1,9 @@
+.token-list {
+  margin-top: 20px;
+
+  .list-header {
+    margin-bottom: 20px !important;
+    font-size: 16px;
+    font-weight: 600;
+  }
+}
