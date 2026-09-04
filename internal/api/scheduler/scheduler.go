@@ -258,11 +258,37 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		//   a) it was just created (before any steps run), or
 		//   b) an intermediate step (e.g. plan) completed and the executor called
 		//      SetPending() to signal "more steps remain".
-		// In both cases the workspace may be locked from a previous step.
-		// We must unlock it here so the scheduler's next poll can pick it up
-		// (the poll query requires w.locked IS NOT TRUE for queue jobs).
-		// The workspace will be re-locked when the next executor step starts.
+		// In both cases the workspace may be locked from a previous step, and we
+		// unlock it here so the scheduler's next poll can pick it up (the poll
+		// query requires w.locked IS NOT TRUE for queue jobs). The workspace will
+		// be re-locked when the next executor step starts.
+		//
+		// But this must NOT fire for a second, independent job on the same
+		// workspace while an older job is still active — that raced the older
+		// job's lock: the older job could legitimately be "running" (still doing
+		// real work) while a brand new job B sits "pending" right after creation,
+		// and unconditionally unlocking here let B's queue→dispatch condition
+		// pass on the very next tick, starting a second concurrent Terraform run
+		// against the same workspace/state. Two 'pending' jobs created in the
+		// same tick raced each other the same way even without an active
+		// 'running' job yet, since both would see no other 'running' row.
+		// Blocking on ANY older, non-terminal job for this workspace (not just
+		// 'running') closes both cases and gives strict per-workspace FIFO.
 		if status == "pending" {
+			var olderActive int
+			s.pool.QueryRow(ctx,
+				`SELECT COUNT(*) FROM job
+				 WHERE workspace_id = $1 AND id < $2
+				   AND status NOT IN ('completed','failed','cancelled','rejected','noChanges','notExecuted')`,
+				workspaceID, jobID,
+			).Scan(&olderActive)
+			if olderActive > 0 {
+				// An older job for this workspace hasn't finished yet — leave this
+				// one pending. It'll be reconsidered on a later poll once the older
+				// job reaches a terminal status.
+				continue
+			}
+
 			_, _ = s.pool.Exec(ctx,
 				"UPDATE workspace SET locked = false WHERE id = (SELECT workspace_id FROM job WHERE id = $1)", jobID)
 			if _, err := s.pool.Exec(ctx,
