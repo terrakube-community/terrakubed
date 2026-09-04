@@ -37,5 +37,16 @@ go.work.sum
 # Terrakube repo
 terrakube-repo/
 
+# UI (Node/React)
+ui/node_modules/
+ui/build/
+ui/dist/
+ui/coverage/
+ui/.env
+ui/.env.local
+ui/.env.*.local
+ui/public/env-config.js
+ui/env-config.js
+
 # Claude Code
 .claude

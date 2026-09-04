@@ -1,0 +1,17 @@
+.organization-grid {
+  padding: 10px;
+  margin-top: 20px;
+}
+.org-card-icon {
+  font-size: 50px;
+  width: 60px;
+  display: flex;
+}
+.org-card-title {
+  font-size: 20px;
+}
+
+/* Dark mode for organization card */
+[data-theme="dark"] .org-card-title {
+  color: #58a6ff;
+}

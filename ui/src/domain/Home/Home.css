@@ -1,0 +1,64 @@
+.HomeButtons > * + * {
+  display: flex;
+  flex-direction: column;
+  margin-block: 10px;
+}
+
+.ant-layout-header {
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+}
+
+.logo {
+  width: 35px;
+  margin-right: 16px;
+}
+
+.user {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  height: 100%;
+  gap: 8px;
+}
+
+.menu {
+  flex: 1;
+  min-width: 0;
+  margin-left: 16px;
+}
+
+.org-selector-container {
+  margin-right: 16px;
+}
+
+.site-layout-content {
+  min-height: 600px;
+  padding: 24px;
+}
+
+.avatar-hover-effect {
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.avatar-hover-effect:hover {
+  color: #fff;
+}
+
+/* Round corners on selected menu item and add spacing */
+.ant-layout-header .ant-menu-horizontal .ant-menu-item {
+  border-radius: 8px !important;
+  margin: 0 4px !important;
+}
+
+.ant-layout-header .ant-menu-horizontal .ant-menu-item-selected {
+  border-radius: 8px !important;
+  background-color: var(--ant-color-primary) !important;
+  border: none !important;
+}
+
+.menu {
+  margin-left: 32px !important;
+}

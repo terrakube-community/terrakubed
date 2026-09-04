@@ -1,0 +1,75 @@
+.orgsActions {
+  display: flex;
+  justify-content: space-between;
+}
+
+.workspaceActions {
+  display: flex;
+  justify-content: space-between;
+}
+
+.moduleActions {
+  display: flex;
+  justify-content: space-between;
+}
+
+.createOrganization {
+  width: 50%;
+  margin: auto;
+  margin-top: 20px;
+}
+
+.ant-tabs-nav-list {
+  padding-right: 80px;
+}
+
+.setting {
+  margin-left: 40px;
+  margin-right: 100px;
+  padding-bottom: 100px;
+}
+
+.addVCS {
+  float: right;
+}
+
+.link {
+  padding: 0;
+}
+
+.vcsList {
+  width: 100%;
+}
+.editor {
+  border: 1px solid #eee;
+}
+
+ul.disc-list {
+  list-style-type: disc;
+}
+
+/* Limit form input width in settings */
+.setting .ant-form-item {
+  max-width: 500px;
+}
+
+.setting .ant-input,
+.setting .ant-input-textarea,
+.setting textarea.ant-input {
+  max-width: 500px;
+}
+
+/* Dark mode for VCS form */
+[data-theme="dark"] .editor {
+  border-color: var(--tk-border-primary);
+  background-color: var(--tk-bg-base);
+}
+
+/* Dark mode for steps in VCS form */
+[data-theme="dark"] .ant-steps-item-title {
+  color: var(--tk-text-primary) !important;
+}
+
+[data-theme="dark"] .ant-steps-item-description {
+  color: var(--tk-text-secondary) !important;
+}
