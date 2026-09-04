@@ -238,7 +238,7 @@ func (p *JobProcessor) uploadStateAndOutput(job *model.TerraformJob, workingDir 
 		if err != nil {
 			log.Printf("Failed to pull raw state: %v", err)
 		} else {
-			rawStatePath := fmt.Sprintf("tfstate/%s/%s/state/state.raw.json", job.OrganizationId, job.WorkspaceId)
+			rawStatePath := fmt.Sprintf("tfstate/%s/%s/state/%s.raw.json", job.OrganizationId, job.WorkspaceId, stateFilename)
 			if err := p.Storage.UploadFile(rawStatePath, strings.NewReader(rawState)); err != nil {
 				log.Printf("Failed to upload raw state: %v", err)
 			}
