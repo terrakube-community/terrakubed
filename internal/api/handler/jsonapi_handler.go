@@ -1109,6 +1109,25 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 					log.Printf("Failed to cancel steps for job %v: %v", id, err)
 				}
 			}
+			if newStatus == "noChanges" {
+				// A plan with no infrastructure changes short-circuits straight from
+				// "Plan running" to job status "noChanges" — it never goes through
+				// the scheduler's normal step-by-step advancement, so the Approval
+				// and Apply step rows (created up front from the job's TCL flow)
+				// are never touched and stay at their initial 'pending' status
+				// forever. The UI renders each step's own status independently of
+				// the job's, so it kept showing "Approval pending" / "Apply pending"
+				// even though the job itself was correctly done. Mirrors Java's
+				// ScheduleJob "case completed" handling (updateJobStepsWithStatus
+				// (..., JobStatus.notExecuted)) — noChanges is the plan-only
+				// equivalent of that terminal state.
+				if _, err := h.pool.Exec(r.Context(),
+					`UPDATE step SET status = 'notExecuted'
+					 WHERE job_id = $1 AND status IN ('pending', 'waitingApproval')`,
+					id); err != nil {
+					log.Printf("Failed to mark remaining steps notExecuted for job %v: %v", id, err)
+				}
+			}
 			switch newStatus {
 			case "completed", "failed", "noChanges", "rejected", "cancelled":
 				// Unlock the workspace when a job reaches any terminal state.
