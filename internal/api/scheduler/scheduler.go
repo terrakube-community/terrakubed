@@ -45,7 +45,15 @@ type Executor interface {
 type ExecutionContext struct {
 	OrganizationID   string            `json:"organizationId"`
 	WorkspaceID      string            `json:"workspaceId"`
-	JobID            int               `json:"jobId"`
+	// The executor's shared TerraformJob struct (internal/model/job.go) declares
+	// JobId as a string. Marshaling this as a bare JSON number made every ephemeral
+	// executor pod's init container crash on startup — "cannot unmarshal number
+	// into Go struct field TerraformJob.jobId of type string" — before it could do
+	// any work or ever call back to the API, which is why jobs sat at "running"
+	// forever with the pod already gone. `,string` marshals/unmarshals this int as
+	// a quoted JSON number, matching what the executor expects, without touching
+	// every other place in this file that treats JobID as an int.
+	JobID            int               `json:"jobId,string"`
 	StepID           string            `json:"stepId"`
 	Type             string            `json:"type"`    // terraformPlan, terraformApply, terraformDestroy, etc.
 	Source           string            `json:"source"`
