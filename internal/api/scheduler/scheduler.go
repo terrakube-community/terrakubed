@@ -208,6 +208,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		LEFT JOIN vcs v ON w.vcs_id = v.id
 		LEFT JOIN agent a ON w.agent_id = a.id
 		WHERE (j.status = 'pending')
+		   OR (j.status = 'approved')
 		   OR (j.status = 'queue' AND w.locked IS NOT TRUE)
 		ORDER BY j.id ASC
 		LIMIT 10
@@ -296,6 +297,42 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 				log.Printf("Job %d: failed to queue: %v", jobID, err)
 			} else {
 				log.Printf("Job %d queued (workspace unlocked for next step)", jobID)
+			}
+			continue
+		}
+
+		// ── approved → queue ─────────────────────────────────────────────────
+		// The UI's Approve button PATCHes job.status to 'approved' directly —
+		// there is no dedicated approval endpoint in the normal flow. This poll
+		// query never selected 'approved' jobs at all (only 'pending' and
+		// 'queue'), so approving a plan did nothing: the job sat at 'approved'
+		// forever, its 'waitingApproval' step never advanced, and the
+		// apply/destroy step never dispatched. Mirrors Java's ScheduleJob
+		// `case approved: executeApprovedJobs(job)`. Mark the approval gate
+		// step 'completed' and fall into the exact same queue transition as
+		// 'pending' so the next poll finds the apply/destroy step.
+		if status == "approved" {
+			var olderActive int
+			s.pool.QueryRow(ctx,
+				`SELECT COUNT(*) FROM job
+				 WHERE workspace_id = $1 AND id < $2
+				   AND status NOT IN ('completed','failed','cancelled','rejected','noChanges','notExecuted')`,
+				workspaceID, jobID,
+			).Scan(&olderActive)
+			if olderActive > 0 {
+				continue
+			}
+
+			_, _ = s.pool.Exec(ctx,
+				`UPDATE step SET status = 'completed'
+				 WHERE job_id = $1 AND status = 'waitingApproval'`, jobID)
+			_, _ = s.pool.Exec(ctx,
+				"UPDATE workspace SET locked = false WHERE id = $1", workspaceID)
+			if _, err := s.pool.Exec(ctx,
+				"UPDATE job SET status = 'queue' WHERE id = $1", jobID); err != nil {
+				log.Printf("Job %d: failed to queue after approval: %v", jobID, err)
+			} else {
+				log.Printf("Job %d approved — approval step completed, queued for apply/destroy", jobID)
 			}
 			continue
 		}
