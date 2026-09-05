@@ -720,10 +720,13 @@ func (h *JSONAPIHandler) atomicUpdate(r *http.Request, resourceType string, conf
 		if newStatus, ok := data["status"].(string); ok {
 			switch newStatus {
 			case "completed", "failed", "noChanges", "rejected", "cancelled":
+				// See the matching block in updateResource for why last_job_status
+				// is written as the plain status name now (Java's ordinal-mapping
+				// quirk no longer applies — Java doesn't run in this deployment).
 				go func(jobID interface{}, status string) {
 					h.pool.Exec(context.Background(),
-						`UPDATE workspace SET locked = false, last_job_date = NOW()
-						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID)
+						`UPDATE workspace SET locked = false, last_job_status = $2, last_job_date = NOW()
+						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID, status)
 				}(id, newStatus)
 			}
 		}
@@ -1149,8 +1152,20 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 				// The executor K8s pod updates job status directly via API; the scheduler
 				// doesn't see terminal-state jobs in its poll loop so workspace unlock
 				// must happen here instead.
-				// NOTE: we intentionally do NOT write last_job_status — the Java API
-				// reads that column as a numeric byte, so writing string values crashes it.
+				//
+				// last_job_status: the column is a plain varchar(36) at the Postgres
+				// level, but Java's Workspace entity has no @Enumerated annotation on
+				// this field, so Hibernate defaulted to EnumType.ORDINAL — Java wrote
+				// the enum's ordinal *number* as a string ("10" for failed, "6" for
+				// noChanges, per JobStatus's declaration order), not its name. We
+				// previously avoided writing this column at all to sidestep that
+				// mismatch, which left it permanently frozen at whatever Java last
+				// wrote (or NULL) — every workspace list card kept showing that stale
+				// numeric string forever, since our own GraphQL resolver serves the
+				// raw column value and the UI expects a status *name* ("completed",
+				// "noChanges", ...) to match against. Since Java no longer runs
+				// anywhere in this deployment, there's no ordinal-parsing consumer
+				// left to break — write the real status name now.
 				go func(jobID interface{}, status string) {
 					// context.Background(), not r.Context(): this goroutine outlives the
 					// HTTP handler (which returns right after firing it and writes the
@@ -1162,9 +1177,10 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 					_, err := h.pool.Exec(context.Background(),
 						`UPDATE workspace SET
 						   locked = false,
+						   last_job_status = $2,
 						   last_job_date = NOW()
 						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`,
-						jobID)
+						jobID, status)
 					if err != nil {
 						log.Printf("Failed to unlock workspace for job %v: %v", jobID, err)
 					} else {
