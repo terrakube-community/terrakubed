@@ -223,7 +223,17 @@ func (e *Executor) ShowState() (string, error) {
 		return "", fmt.Errorf("error running NewTerraform: %s", err)
 	}
 
-	state, err := tf.ShowStateFile(context.Background(), filepath.Join(e.WorkingDir, "terraform.tfstate"))
+	// tf.Show (not ShowStateFile) — ShowStateFile requires a local state file
+	// on disk, which only exists for the "local" backend. Any workspace using
+	// a remote backend (S3, etc. — the normal case here) has no such file:
+	// the state lives in the backend, and terraform only keeps a small
+	// pointer/lock locally. ShowStateFile failed for every remote-backend
+	// run ("error running Show: ..."), so the JSON state upload was silently
+	// skipped every time — only StatePull's raw state (which does go through
+	// the configured backend, matching `terraform state pull`) ever made it
+	// to storage. tf.Show mirrors plain `terraform show`, which reads the
+	// current state through whatever backend is configured, local or remote.
+	state, err := tf.Show(context.Background())
 	if err != nil {
 		return "", fmt.Errorf("error running Show: %s", err)
 	}
