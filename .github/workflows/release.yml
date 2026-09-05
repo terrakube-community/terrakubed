@@ -9,6 +9,31 @@ permissions:
   contents: write
 
 jobs:
+  detect-ui-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check whether ui/ changed since the previous tag
+        id: check
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^${GITHUB_REF_NAME}$" | tail -n1)
+          if [ -z "$PREV_TAG" ] || [ "$PREV_TAG" == "$GITHUB_REF_NAME" ]; then
+            echo "No previous tag found — building UI image to be safe."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$PREV_TAG" "$GITHUB_REF_NAME" -- ui/; then
+            echo "ui/ unchanged since $PREV_TAG — skipping UI build."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ui/ changed since $PREV_TAG — building UI image."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -43,6 +68,8 @@ jobs:
           generate_release_notes: true
 
   build-ui:
+    needs: detect-ui-changes
+    if: needs.detect-ui-changes.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
