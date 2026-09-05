@@ -520,9 +520,10 @@ func (s *JobScheduler) maybeCompleteJob(ctx context.Context, jobID int) {
 		s.pool.Exec(ctx, `
 			UPDATE workspace SET
 			  locked = false,
+			  last_job_status = $2,
 			  last_job_date = NOW()
 			WHERE id = (SELECT workspace_id FROM job WHERE id = $1)
-		`, jobID)
+		`, jobID, finalStatus)
 
 		// Post commit status back to VCS provider (async, best-effort)
 		go s.postCommitStatus(ctx, jobID, finalStatus)
