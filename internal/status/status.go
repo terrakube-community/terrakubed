@@ -131,7 +131,7 @@ func (s *Service) IsCancelled(job *model.TerraformJob) bool {
 }
 
 func (s *Service) CreateHistory(job *model.TerraformJob, stateURL string) error {
-	return s.client.CreateHistory(job.OrganizationId, job.WorkspaceId, stateURL)
+	return s.client.CreateHistory(job.OrganizationId, job.WorkspaceId, job.JobId, stateURL)
 }
 
 // saveOutput uploads the terraform log output to object storage and returns the output URL path.

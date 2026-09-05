@@ -67,12 +67,13 @@ func (c *TerrakubeClient) UpdateJobCommitId(orgId, jobId, commitId string) error
 }
 
 // CreateHistory creates a workspace history record after apply/destroy.
-func (c *TerrakubeClient) CreateHistory(orgId, workspaceId, stateURL string) error {
+func (c *TerrakubeClient) CreateHistory(orgId, workspaceId, jobId, stateURL string) error {
 	payload := map[string]interface{}{
 		"data": map[string]interface{}{
 			"type": "history",
 			"attributes": map[string]interface{}{
-				"output": stateURL,
+				"output":       stateURL,
+				"jobReference": jobId,
 			},
 		},
 	}
