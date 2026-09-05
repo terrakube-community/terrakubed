@@ -1128,6 +1128,21 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 					log.Printf("Failed to mark remaining steps notExecuted for job %v: %v", id, err)
 				}
 			}
+			if newStatus == "rejected" {
+				// Same shape as noChanges above: "Discard" PATCHes job.status
+				// straight to 'rejected', jumping past the scheduler entirely, so
+				// the waitingApproval step and the not-yet-dispatched apply/destroy
+				// step were left stuck showing pending/waiting forever. Mirrors
+				// Java's ScheduleJob "case rejected" handling (same
+				// updateJobStepsWithStatus call as cancelled/failed, which uses
+				// JobStatus.failed for remaining steps, not notExecuted).
+				if _, err := h.pool.Exec(r.Context(),
+					`UPDATE step SET status = 'failed'
+					 WHERE job_id = $1 AND status IN ('pending', 'waitingApproval')`,
+					id); err != nil {
+					log.Printf("Failed to mark remaining steps failed for rejected job %v: %v", id, err)
+				}
+			}
 			switch newStatus {
 			case "completed", "failed", "noChanges", "rejected", "cancelled":
 				// Unlock the workspace when a job reaches any terminal state.
