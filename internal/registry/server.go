@@ -272,7 +272,11 @@ func Start(cfg *config.Config) {
 			sshNode := moduleDetails.Ssh.Edges[0].Node
 			vcsType = "SSH~" + sshNode.SshType
 			accessToken = sshNode.PrivateKey
+		} else {
+			log.Printf("Module %s/%s/%s (id=%s) has no linked VCS or SSH connection — cloning as PUBLIC, which will fail for a private repo", org, name, provider, moduleDetails.ID)
 		}
+
+		log.Printf("Module %s/%s/%s: vcsType=%q connectionType=%q hasToken=%v", org, name, provider, vcsType, connectionType, accessToken != "")
 
 		path, err := storageService.SearchModule(org, name, provider, version, source, vcsType, connectionType, accessToken, tagPrefix, folder)
 		if err != nil {
