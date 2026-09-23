@@ -127,27 +127,32 @@ func (h *GraphQLHandler) executeQuery(r *http.Request, query string, variables m
 }
 
 func (h *GraphQLHandler) fetchByIDs(ctx context.Context, resourceType string, meta *repository.ResourceMeta, ids []string, fields []string, relationships []relInfo) (interface{}, error) {
-	nodes := make([]map[string]interface{}, 0)
+	rows, err := h.repo.FindByIDs(ctx, resourceType, ids)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch %s: %w", resourceType, err)
+	}
 
+	// FindByIDs doesn't guarantee result order, so index by ID and walk the
+	// originally-requested ids to preserve order and skip any not found.
+	byID := make(map[string]map[string]interface{}, len(rows))
+	for _, row := range rows {
+		byID[fmt.Sprintf("%v", row[meta.PKColumn])] = row
+	}
+
+	rowIDs := make([]string, 0, len(ids))
+	rowList := make([]map[string]interface{}, 0, len(ids))
+	nodes := make([]map[string]interface{}, 0, len(ids))
 	for _, id := range ids {
-		row, err := h.repo.FindByID(ctx, resourceType, id)
-		if err != nil {
+		row, ok := byID[id]
+		if !ok {
 			continue
 		}
-		node := filterFields(row, fields)
-
-		// Resolve relationships, passing the full row for FK access on parent rels
-		for _, rel := range relationships {
-			relData, err := h.resolveRelationship(ctx, id, row, meta, rel)
-			if err != nil {
-				log.Printf("GraphQL: error resolving rel %s for %s/%s: %v", rel.name, resourceType, id, err)
-			} else {
-				node[rel.name] = relData
-			}
-		}
-
-		nodes = append(nodes, node)
+		rowIDs = append(rowIDs, id)
+		rowList = append(rowList, row)
+		nodes = append(nodes, filterFields(row, fields))
 	}
+
+	h.resolveRelationshipsForRows(ctx, resourceType, rowIDs, rowList, meta, relationships, nodes)
 
 	return map[string]interface{}{
 		resourceType: map[string]interface{}{
@@ -175,23 +180,14 @@ func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta
 		return nil, fmt.Errorf("failed to list %s: %w", resourceType, err)
 	}
 
-	nodes := make([]map[string]interface{}, 0, len(rows))
-	for _, row := range rows {
-		node := filterFields(row, fields)
-
-		// Resolve relationships, passing the full row for FK access on parent rels
-		id := fmt.Sprintf("%v", row[meta.PKColumn])
-		for _, rel := range relationships {
-			relData, err := h.resolveRelationship(ctx, id, row, meta, rel)
-			if err != nil {
-				log.Printf("GraphQL: error resolving rel %s for %s/%s: %v", rel.name, resourceType, id, err)
-			} else {
-				node[rel.name] = relData
-			}
-		}
-
-		nodes = append(nodes, node)
+	ids := make([]string, len(rows))
+	nodes := make([]map[string]interface{}, len(rows))
+	for i, row := range rows {
+		ids[i] = fmt.Sprintf("%v", row[meta.PKColumn])
+		nodes[i] = filterFields(row, fields)
 	}
+
+	h.resolveRelationshipsForRows(ctx, resourceType, ids, rows, meta, relationships, nodes)
 
 	return map[string]interface{}{
 		resourceType: map[string]interface{}{
@@ -200,34 +196,46 @@ func (h *GraphQLHandler) fetchAll(ctx context.Context, resourceType string, meta
 	}, nil
 }
 
-// resolveRelationship resolves a single relationship for a parent resource node.
-// parentRow is the full DB row for the parent (used to read FK values for to-one rels).
-func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID string, parentRow map[string]interface{}, parentMeta *repository.ResourceMeta, rel relInfo) (interface{}, error) {
-	// ── To-one (parent) relationship ──
-	if toOneRel, ok := parentMeta.Parents[rel.name]; ok {
-		fkVal := parentRow[toOneRel.FKColumn]
-		if fkVal == nil {
-			return map[string]interface{}{"edges": wrapEdges([]map[string]interface{}{})}, nil
+// resolveRelationshipsForRows resolves every requested relationship for a
+// whole batch of parent rows in a fixed number of queries — one per
+// relationship (two for a to-many with nested sub-relationships),
+// regardless of how many rows are in the batch. This replaces resolving
+// each relationship per row, which issued one DB round-trip per row per
+// relationship (an N+1 query pattern: e.g. listing 50 workspaces and
+// requesting `vcs { ... }` on each used to run 50 separate lookups instead
+// of one `WHERE id IN (...)`).
+//
+// Mutates nodes[i][rel.name] in place. ids/rows/nodes must be the same
+// length and index-aligned.
+func (h *GraphQLHandler) resolveRelationshipsForRows(ctx context.Context, resourceType string, ids []string, rows []map[string]interface{}, meta *repository.ResourceMeta, rels []relInfo, nodes []map[string]interface{}) {
+	if len(ids) == 0 {
+		return
+	}
+	for _, rel := range rels {
+		perParent, err := h.resolveRelationshipBatch(ctx, ids, rows, meta, rel)
+		if err != nil {
+			log.Printf("GraphQL: error resolving rel %s for %s: %v", rel.name, resourceType, err)
+			continue
 		}
-		relMeta, ok := h.repo.GetMeta(toOneRel.ParentType)
-		if !ok {
-			return nil, fmt.Errorf("unknown type: %s", toOneRel.ParentType)
-		}
-		relRow, err := h.repo.FindByID(ctx, toOneRel.ParentType, fkVal)
-		if err != nil || relRow == nil {
-			return map[string]interface{}{"edges": wrapEdges([]map[string]interface{}{})}, nil
-		}
-		node := filterFields(relRow, rel.fields)
-		relID := fmt.Sprintf("%v", relRow[relMeta.PKColumn])
-		for _, subRel := range rel.rels {
-			subData, err := h.resolveRelationship(ctx, relID, relRow, relMeta, subRel)
-			if err == nil {
-				node[subRel.name] = subData
+		for i, id := range ids {
+			if data, ok := perParent[id]; ok {
+				nodes[i][rel.name] = data
+			} else {
+				nodes[i][rel.name] = map[string]interface{}{"edges": wrapEdges(nil)}
 			}
 		}
-		return map[string]interface{}{
-			"edges": wrapEdges([]map[string]interface{}{node}),
-		}, nil
+	}
+}
+
+// resolveRelationshipBatch resolves a single relationship for every row in
+// the batch at once, returning parentID -> the relationship's
+// {"edges": [...]} value. A parent with no match (e.g. a NULL FK, or no
+// matching children) is simply absent from the result — the caller fills in
+// an empty relationship for it.
+func (h *GraphQLHandler) resolveRelationshipBatch(ctx context.Context, parentIDs []string, parentRows []map[string]interface{}, parentMeta *repository.ResourceMeta, rel relInfo) (map[string]interface{}, error) {
+	// ── To-one (parent) relationship ──
+	if toOneRel, ok := parentMeta.Parents[rel.name]; ok {
+		return h.resolveToOneBatch(ctx, parentIDs, parentRows, toOneRel, rel)
 	}
 
 	// ── To-many (child) relationship ──
@@ -235,14 +243,77 @@ func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID strin
 	if !ok {
 		return nil, fmt.Errorf("unknown relationship: %s", rel.name)
 	}
+	return h.resolveToManyBatch(ctx, parentIDs, childRel, rel)
+}
 
-	// Get child meta for PK column
+// resolveToOneBatch resolves a to-one relationship (e.g. module.vcs) for a
+// whole batch of parent rows with a single FindByIDs call, instead of one
+// FindByID call per row.
+func (h *GraphQLHandler) resolveToOneBatch(ctx context.Context, parentIDs []string, parentRows []map[string]interface{}, toOneRel repository.ParentRelation, rel relInfo) (map[string]interface{}, error) {
+	relMeta, ok := h.repo.GetMeta(toOneRel.ParentType)
+	if !ok {
+		return nil, fmt.Errorf("unknown type: %s", toOneRel.ParentType)
+	}
+
+	// Collect the distinct FK values referenced across this batch, and which
+	// parent IDs point at each one — a shared reference (many rows pointing
+	// at the same related row, e.g. several workspaces on one vcs) is legal.
+	fkToParents := make(map[string][]string)
+	var fkValues []string
+	for i, pid := range parentIDs {
+		fkVal := parentRows[i][toOneRel.FKColumn]
+		if fkVal == nil {
+			continue
+		}
+		fkStr := fmt.Sprintf("%v", fkVal)
+		if _, seen := fkToParents[fkStr]; !seen {
+			fkValues = append(fkValues, fkStr)
+		}
+		fkToParents[fkStr] = append(fkToParents[fkStr], pid)
+	}
+	if len(fkValues) == 0 {
+		return map[string]interface{}{}, nil
+	}
+
+	relRows, err := h.repo.FindByIDs(ctx, toOneRel.ParentType, fkValues)
+	if err != nil {
+		return nil, err
+	}
+
+	relIDs := make([]string, len(relRows))
+	relNodes := make([]map[string]interface{}, len(relRows))
+	for i, relRow := range relRows {
+		relIDs[i] = fmt.Sprintf("%v", relRow[relMeta.PKColumn])
+		relNodes[i] = filterFields(relRow, rel.fields)
+	}
+	// Resolve nested sub-relationships once for the distinct related rows in
+	// this batch (e.g. many modules sharing one vcs → one resolution).
+	h.resolveRelationshipsForRows(ctx, toOneRel.ParentType, relIDs, relRows, relMeta, rel.rels, relNodes)
+
+	result := make(map[string]interface{}, len(parentIDs))
+	for i, relID := range relIDs {
+		wrapped := map[string]interface{}{"edges": wrapEdges([]map[string]interface{}{relNodes[i]})}
+		for _, pid := range fkToParents[relID] {
+			result[pid] = wrapped
+		}
+	}
+	return result, nil
+}
+
+// resolveToManyBatch resolves a to-many relationship (e.g. module.version)
+// for a whole batch of parent rows with a single FK-IN(...) query, instead
+// of one List call per parent row.
+func (h *GraphQLHandler) resolveToManyBatch(ctx context.Context, parentIDs []string, childRel repository.ChildRelation, rel relInfo) (map[string]interface{}, error) {
 	childMeta, _ := h.repo.GetMeta(childRel.ChildType)
 
 	// Build the list of DB columns to SELECT:
 	// - requested fields (camelCase → snake_case)
 	// - PK column (needed for sub-relationships)
-	// - FK column (needed for the WHERE clause)
+	// - FK column (needed to bucket results back by parent)
+	// - FK columns needed by nested sub-relationships (e.g. "vcs"/"ssh"
+	//   requested inside "module") — without this, a genuinely-set FK
+	//   (module.vcs_id) would never even be selected, so it would read back
+	//   as nil and be reported as "no relationship".
 	colSet := make(map[string]bool)
 	colSet[childRel.FKColumn] = true
 	if childMeta != nil {
@@ -251,12 +322,6 @@ func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID strin
 	for _, f := range rel.fields {
 		colSet[camelToSnake(f)] = true
 	}
-	// Also include FK columns needed by nested sub-relationships (e.g. "vcs"/
-	// "ssh" requested inside "module"). Without this, the recursive
-	// resolveRelationship call below receives a row that never had that FK
-	// column selected at all — a missing map key reads back as nil, so a
-	// genuinely-set FK (module.vcs_id) was reported as "no relationship",
-	// even though the DB column was populated all along.
 	if childMeta != nil {
 		for _, subRel := range rel.rels {
 			if parentSubRel, ok := childMeta.Parents[subRel.name]; ok {
@@ -269,39 +334,41 @@ func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID strin
 		selectCols = append(selectCols, c)
 	}
 
-	// Query children using the FK column, selecting only needed columns
-	params := repository.ListParams{
-		ParentFK: childRel.FKColumn,
-		ParentID: parentID,
-		Columns:  selectCols,
-		Sort:     rel.sort,
-	}
-	rows, err := h.repo.List(ctx, childRel.ChildType, params)
+	childRows, err := h.repo.ListByParentFKs(ctx, childRel.ChildType, childRel.FKColumn, parentIDs, selectCols, rel.sort)
 	if err != nil {
 		return nil, err
 	}
-
-	nodes := make([]map[string]interface{}, 0, len(rows))
-	for _, row := range rows {
-		node := filterFields(row, rel.fields)
-
-		// Resolve nested sub-relationships (e.g., workspaceTag inside workspace)
-		if childMeta != nil {
-			childID := fmt.Sprintf("%v", row[childMeta.PKColumn])
-			for _, subRel := range rel.rels {
-				subData, err := h.resolveRelationship(ctx, childID, row, childMeta, subRel)
-				if err == nil {
-					node[subRel.name] = subData
-				}
-			}
-		}
-
-		nodes = append(nodes, node)
+	if len(childRows) == 0 {
+		return map[string]interface{}{}, nil
 	}
 
-	return map[string]interface{}{
-		"edges": wrapEdges(nodes),
-	}, nil
+	childIDs := make([]string, len(childRows))
+	childNodes := make([]map[string]interface{}, len(childRows))
+	parentOf := make([]string, len(childRows))
+	for i, row := range childRows {
+		if childMeta != nil {
+			childIDs[i] = fmt.Sprintf("%v", row[childMeta.PKColumn])
+		}
+		childNodes[i] = filterFields(row, rel.fields)
+		parentOf[i] = fmt.Sprintf("%v", row[childRel.FKColumn])
+	}
+
+	// Resolve nested sub-relationships (e.g. workspaceTag inside workspace)
+	// once for every child row in the batch, not once per parent row.
+	if childMeta != nil && len(rel.rels) > 0 {
+		h.resolveRelationshipsForRows(ctx, childRel.ChildType, childIDs, childRows, childMeta, rel.rels, childNodes)
+	}
+
+	byParent := make(map[string][]map[string]interface{})
+	for i, node := range childNodes {
+		byParent[parentOf[i]] = append(byParent[parentOf[i]], node)
+	}
+
+	result := make(map[string]interface{}, len(byParent))
+	for pid, nodes := range byParent {
+		result[pid] = map[string]interface{}{"edges": wrapEdges(nodes)}
+	}
+	return result, nil
 }
 
 // executeMutation handles create/update/delete mutations.
