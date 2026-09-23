@@ -218,7 +218,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		       COALESCE(NULLIF(j.override_source,''), w.source),
 		       COALESCE(NULLIF(j.override_branch,''), w.branch),
 		       w.folder, w.terraform_version, w.iac_type,
-		       w.module_ssh_key,
+		       w.module_ssh_key, w.name,
 		       COALESCE(v.vcs_type,''), COALESCE(v.connection_type,''), COALESCE(v.access_token,''),
 		       COALESCE(w.vcs_id::text,''),
 		       COALESCE(a.url,'')
@@ -254,6 +254,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			terraformVersion *string
 			iacType          *string
 			moduleSshKey     *string
+			workspaceName    string
 			vcsType          string
 			connectionType   string
 			accessToken      string
@@ -265,7 +266,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			&jobID, &status, &jobTCL, &commitID,
 			&orgID, &workspaceID, &refresh, &refreshOnly,
 			&source, &branch, &folder, &terraformVersion, &iacType,
-			&moduleSshKey,
+			&moduleSshKey, &workspaceName,
 			&vcsType, &connectionType, &accessToken,
 			&vcsID, &agentURL,
 		); err != nil {
@@ -443,6 +444,10 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			TCL:              deref(jobTCL),
 		}
 		execCtx.EnvVars = s.loadVariables(ctx, orgID, workspaceID, "ENV")
+		// Mirrors Java's ExecutorService.java: environmentVariables.put("workspaceName", ...).
+		// Consumed by the executor's Slack notifier, which otherwise falls back to the
+		// raw workspace UUID — see executor_notify.go's slackSend.
+		execCtx.EnvVars["workspaceName"] = workspaceName
 		execCtx.TFVars = s.loadVariables(ctx, orgID, workspaceID, "TERRAFORM")
 
 		// Write context.json to storage so Java executor agents can fetch it via
