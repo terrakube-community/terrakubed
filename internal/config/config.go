@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"strconv"
 
 	"github.com/terrakube-community/terrakubed/internal/model"
 )
@@ -44,12 +45,16 @@ type Config struct {
 	StorageType             string
 
 	// API Specific
-	DatabaseURL   string
-	Hostname      string
-	ApiPort       string
-	OwnerGroup    string
-	RedisAddress  string
-	RedisPassword string
+	DatabaseURL                   string
+	Hostname                      string
+	ApiPort                       string
+	OwnerGroup                    string
+	RedisAddress                  string
+	RedisPassword                 string
+	TerraformReleasesUrl          string
+	TofuReleasesUrl               string
+	TofuGithubToken               string
+	ReleaseCacheExpirationMinutes int64
 
 	// API → Kubernetes executor config
 	ExecutorNamespace      string
@@ -69,6 +74,15 @@ func getEnvWithFallback(primary, fallback string) string {
 func getEnv(key, fallback string) string {
 	if value, ok := os.LookupEnv(key); ok {
 		return value
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int64) int64 {
+	if value, ok := os.LookupEnv(key); ok {
+		if n, err := strconv.ParseInt(value, 10, 64); err == nil {
+			return n
+		}
 	}
 	return fallback
 }
@@ -225,9 +239,9 @@ func LoadConfig() (*Config, error) {
 		StorageType:             getStorageType(),
 
 		// API
-		DatabaseURL:   buildDatabaseURL(),
-		Hostname:      getEnvWithFallback("TERRAKUBE_HOSTNAME", "TerrakubeHostname"),
-		ApiPort:       getEnv("API_PORT", "8080"),
+		DatabaseURL: buildDatabaseURL(),
+		Hostname:    getEnvWithFallback("TERRAKUBE_HOSTNAME", "TerrakubeHostname"),
+		ApiPort:     getEnv("API_PORT", "8080"),
 		// Java API equivalent: ${TERRAKUBE_OWNER:TerrakubeOwner}
 		// Try TERRAKUBE_OWNER first, then TerrakubeOwner env var, then hardcoded default.
 		// getEnvWithFallback treats the second arg as another env var name (not a value),
@@ -240,6 +254,13 @@ func LoadConfig() (*Config, error) {
 		}(),
 		RedisAddress:  buildRedisAddress(),
 		RedisPassword: getEnvChain("TerrakubeRedisPassword", "REDIS_PASSWORD"),
+		// Java equivalents: io.terrakube.terraform.json.releasesUrl / io.terrakube.tofu.json.*,
+		// set via CustomTerraformReleasesUrl / CustomTofuReleasesUrl / CustomReleaseGithubToken /
+		// CustomReleaseCacheExpirationMinutes.
+		TerraformReleasesUrl:          getEnv("CustomTerraformReleasesUrl", "https://releases.hashicorp.com/terraform/index.json"),
+		TofuReleasesUrl:               getEnv("CustomTofuReleasesUrl", "https://api.github.com/repos/opentofu/opentofu/releases"),
+		TofuGithubToken:               getEnv("CustomReleaseGithubToken", ""),
+		ReleaseCacheExpirationMinutes: getEnvInt("CustomReleaseCacheExpirationMinutes", 30),
 
 		// Kubernetes executor.
 		// The Helm chart sets these as literal container env vars using Java's

@@ -56,18 +56,24 @@ type Config struct {
 	ExecutorImage          string
 	ExecutorSecretName     string
 	ExecutorServiceAccount string
+
+	// Terraform/OpenTofu version dropdown — proxied+cached releases index.
+	TerraformReleasesUrl       string
+	TofuReleasesUrl            string
+	TofuGithubToken            string
+	ReleaseCacheExpirationMins int64
 }
 
 // Server is the main API server.
 type Server struct {
-	config           Config
-	db               *database.Pool
-	repo             *repository.GenericRepository
-	handler          http.Handler
-	scheduler        *scheduler.JobScheduler
-	schedulePoller   *scheduler.SchedulePoller
-	moduleRefresher  *scheduler.ModuleRefreshScheduler
-	tokenRefresher   *vcs.TokenRefresher
+	config          Config
+	db              *database.Pool
+	repo            *repository.GenericRepository
+	handler         http.Handler
+	scheduler       *scheduler.JobScheduler
+	schedulePoller  *scheduler.SchedulePoller
+	moduleRefresher *scheduler.ModuleRefreshScheduler
+	tokenRefresher  *vcs.TokenRefresher
 }
 
 // NewServer creates a new API server.
@@ -225,6 +231,13 @@ func NewServer(config Config) (*Server, error) {
 	// Used by Slack notifications when TERRAKUBE_UI_URL isn't set on the executor
 	appRedirectHandler := handler.NewAppRedirectHandler(config.UIURL)
 	mux.Handle("/app/", appRedirectHandler)
+
+	// Terraform/OpenTofu version dropdown (Workspace Settings → Terraform
+	// Version) — proxies+caches each tool's releases index.
+	releasesHandler := handler.NewReleasesHandler(
+		config.TerraformReleasesUrl, config.TofuReleasesUrl, config.TofuGithubToken, config.ReleaseCacheExpirationMins)
+	mux.Handle("/terraform/index.json", releasesHandler)
+	mux.Handle("/tofu/index.json", releasesHandler)
 
 	// State & TFE endpoints
 	mux.Handle("/tfstate/v1/", stateHandler)
