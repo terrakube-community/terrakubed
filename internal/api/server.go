@@ -66,6 +66,7 @@ type Server struct {
 	handler          http.Handler
 	scheduler        *scheduler.JobScheduler
 	schedulePoller   *scheduler.SchedulePoller
+	moduleRefresher  *scheduler.ModuleRefreshScheduler
 	tokenRefresher   *vcs.TokenRefresher
 }
 
@@ -278,17 +279,22 @@ func NewServer(config Config) (*Server, error) {
 	tclProc := tcl.NewProcessor(db.Pool)
 	schedulePoller := scheduler.NewSchedulePoller(db.Pool, tclProc)
 
+	// Module refresh scheduler: periodically syncs new VCS tags into
+	// module_version, mirroring Java's ModuleRefreshJob/ModuleRefreshService.
+	moduleRefresher := scheduler.NewModuleRefreshScheduler(db.Pool, 5*time.Minute)
+
 	// VCS token refresher: keeps OAuth tokens alive for GitLab/Bitbucket
 	tokenRefresher := vcs.NewTokenRefresher(db.Pool)
 
 	return &Server{
-		config:         config,
-		db:             db,
-		repo:           repo,
-		handler:        finalHandler,
-		scheduler:      jobScheduler,
-		schedulePoller: schedulePoller,
-		tokenRefresher: tokenRefresher,
+		config:          config,
+		db:              db,
+		repo:            repo,
+		handler:         finalHandler,
+		scheduler:       jobScheduler,
+		schedulePoller:  schedulePoller,
+		moduleRefresher: moduleRefresher,
+		tokenRefresher:  tokenRefresher,
 	}, nil
 }
 
@@ -304,6 +310,11 @@ func (s *Server) Start() error {
 	if s.schedulePoller != nil {
 		go s.schedulePoller.Start(ctx)
 		log.Printf("Schedule poller started (sync interval: 60s)")
+	}
+
+	if s.moduleRefresher != nil {
+		go s.moduleRefresher.Start(ctx)
+		log.Printf("Module refresh scheduler started (interval: 5m)")
 	}
 
 	if s.tokenRefresher != nil {

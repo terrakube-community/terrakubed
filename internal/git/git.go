@@ -10,6 +10,9 @@ import (
 
 type GitService interface {
 	CloneRepository(source, version, vcsType, connectionType, accessToken, tagPrefix, folder string) (string, error)
+	// ListRemoteTags returns tag name -> commit SHA for the given repository
+	// without cloning it (`git ls-remote --tags`).
+	ListRemoteTags(source, vcsType, connectionType, accessToken string) (map[string]string, error)
 }
 
 type Service struct{}
@@ -116,6 +119,52 @@ func (s *Service) CloneRepository(source, version, vcsType, connectionType, acce
 	}
 
 	return tempDir, nil
+}
+
+// ListRemoteTags lists tags on a remote repository without cloning it,
+// mirroring `git ls-remote --tags`. For an annotated tag, `git ls-remote`
+// reports two lines — the tag object's own SHA, and a peeled "<tag>^{}" line
+// with the commit SHA the tag actually points at. We keep the peeled commit
+// SHA when present (it's the one that matters for identifying the commit),
+// falling back to the tag object SHA for lightweight tags.
+func (s *Service) ListRemoteTags(source, vcsType, connectionType, accessToken string) (map[string]string, error) {
+	tempDir, err := os.MkdirTemp("", "terrakube-lsremote")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	repoURL := setupCredentialURL(source, vcsType, connectionType, accessToken)
+
+	env, sshCleanup, err := setupSSHEnv(vcsType, accessToken, tempDir)
+	if err != nil {
+		return nil, err
+	}
+	defer sshCleanup()
+
+	cmd := exec.Command("git", "ls-remote", "--tags", repoURL)
+	cmd.Env = env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("git ls-remote failed: %s: %w", string(output), err)
+	}
+
+	tags := make(map[string]string)
+	const tagRefPrefix = "refs/tags/"
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || !strings.HasPrefix(fields[1], tagRefPrefix) {
+			continue
+		}
+		sha, tagName := fields[0], strings.TrimPrefix(fields[1], tagRefPrefix)
+		if peeled, ok := strings.CutSuffix(tagName, "^{}"); ok {
+			tags[peeled] = sha
+		} else if _, exists := tags[tagName]; !exists {
+			tags[tagName] = sha
+		}
+	}
+
+	return tags, nil
 }
 
 func (s *Service) CloneWorkspace(source, branch, vcsType, connectionType, accessToken, folder string, jobId string) (string, error) {
