@@ -590,6 +590,9 @@ func (h *RemoteTFEHandler) applyRun(w http.ResponseWriter, r *http.Request, runI
 
 	h.pool.Exec(r.Context(), "UPDATE step SET status = 'completed' WHERE id = $1", stepID)
 	h.pool.Exec(r.Context(), "UPDATE job SET status = 'queue' WHERE id = $1", jobID)
+	h.pool.Exec(r.Context(),
+		`UPDATE workspace SET last_job_status = 'queue', last_job_date = NOW()
+		 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID)
 
 	log.Printf("TFE: run %s (job %d) approved via API", runID, jobID)
 	w.WriteHeader(http.StatusOK)

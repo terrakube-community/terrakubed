@@ -192,6 +192,25 @@ func (s *JobScheduler) pollCancels(ctx context.Context) {
 //   - terraformPlan / terraformPlanDestroy / terraformApply / terraformDestroy → K8s executor
 //   - approval → set waitingApproval, skip (user must POST approval)
 //   - notExecuted → mark complete, advance
+// touchWorkspaceLastJobStatus mirrors Java's JobManageHook.updateWorkspaceStatus,
+// which runs unconditionally after every job status transition (not just
+// terminal ones) — Elide's lifecycle hook fires whenever the job entity is
+// saved, and Java's Quartz ScheduleJob.runExecution calls it once per tick
+// right after applying whatever transition happened. Without this, the
+// workspace list (and anything else reading workspace.lastJobStatus) freezes
+// at the last *terminal* status forever and never shows "running" or
+// "waitingApproval" while a job is actually in progress. This never touches
+// `locked` — locking is managed independently by the code that owns each
+// transition.
+func (s *JobScheduler) touchWorkspaceLastJobStatus(ctx context.Context, jobID interface{}, status string) {
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE workspace SET last_job_status = $2, last_job_date = NOW()
+		 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`,
+		jobID, status); err != nil {
+		log.Printf("Job %v: failed to update workspace last_job_status=%s: %v", jobID, status, err)
+	}
+}
+
 func (s *JobScheduler) pollJobs(ctx context.Context) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT j.id, j.status, j.tcl, j.commit_id,
@@ -297,6 +316,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 				log.Printf("Job %d: failed to queue: %v", jobID, err)
 			} else {
 				log.Printf("Job %d queued (workspace unlocked for next step)", jobID)
+				s.touchWorkspaceLastJobStatus(ctx, jobID, "queue")
 			}
 			continue
 		}
@@ -333,6 +353,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 				log.Printf("Job %d: failed to queue after approval: %v", jobID, err)
 			} else {
 				log.Printf("Job %d approved — approval step completed, queued for apply/destroy", jobID)
+				s.touchWorkspaceLastJobStatus(ctx, jobID, "queue")
 			}
 			continue
 		}
@@ -375,6 +396,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 					"UPDATE step SET status = 'waitingApproval' WHERE id = $1", stepID)
 				_, _ = s.pool.Exec(ctx,
 					"UPDATE job SET status = 'waitingApproval' WHERE id = $1", jobID)
+				s.touchWorkspaceLastJobStatus(ctx, jobID, "waitingApproval")
 				log.Printf("Job %d waiting for approval (step %s)", jobID, stepID)
 			}
 			continue
@@ -434,7 +456,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			"UPDATE job SET status = 'running' WHERE id = $1", jobID)
 		// Lock the workspace for the duration of the run to prevent concurrent executions
 		_, _ = s.pool.Exec(ctx,
-			"UPDATE workspace SET locked = true WHERE id = $1", workspaceID)
+			"UPDATE workspace SET locked = true, last_job_status = 'running', last_job_date = NOW() WHERE id = $1", workspaceID)
 		// Post "pending" commit status at the start of a run
 		go s.postCommitStatusForStep(ctx, jobID, stepType)
 
@@ -449,7 +471,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			log.Printf("Job %d: no executor available (K8s executor not configured and no agent URL), skipping", jobID)
 			s.pool.Exec(ctx, "UPDATE step SET status = 'failed' WHERE id = $1", stepID)
 			s.pool.Exec(ctx, "UPDATE job SET status = 'failed' WHERE id = $1", jobID)
-			s.pool.Exec(ctx, "UPDATE workspace SET locked = false WHERE id = $1", workspaceID)
+			s.pool.Exec(ctx, "UPDATE workspace SET locked = false, last_job_status = 'failed', last_job_date = NOW() WHERE id = $1", workspaceID)
 			continue
 		}
 
@@ -459,7 +481,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 				s.pool.Exec(ctx, "UPDATE step SET status = 'failed' WHERE id = $1", sID)
 				s.pool.Exec(ctx, "UPDATE job SET status = 'failed' WHERE id = $1", jID)
 				// Unlock workspace on executor failure so future jobs can run
-				s.pool.Exec(ctx, "UPDATE workspace SET locked = false WHERE id = $1", wsID)
+				s.pool.Exec(ctx, "UPDATE workspace SET locked = false, last_job_status = 'failed', last_job_date = NOW() WHERE id = $1", wsID)
 			}
 			// On success: executor updates status via API callbacks when it completes.
 			// Workspace unlock happens in the JSONAPI handler on terminal status.
