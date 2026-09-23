@@ -201,6 +201,12 @@ func (w *Workspace) persistSSHKey() error {
 	if err := os.Chmod(keyFile.Name(), 0600); err != nil {
 		return fmt.Errorf("chmod key file: %w", err)
 	}
+	// Normalize CRLF → LF. A key pasted or migrated via a Windows-originated
+	// tool can pick up \r\n line endings; the system ssh client's PEM parser
+	// is far stricter about this than Java's pure-Java SSH stack (JGit +
+	// Apache MINA SSHD) was, and fails with an opaque "error in libcrypto"
+	// rather than a line-ending-specific error.
+	keyContent = strings.ReplaceAll(keyContent, "\r\n", "\n")
 	// Ensure key ends with newline — some SSH implementations reject keys that don't.
 	if !strings.HasSuffix(keyContent, "\n") {
 		keyContent += "\n"
