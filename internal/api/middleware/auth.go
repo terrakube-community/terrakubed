@@ -101,6 +101,11 @@ var publicPaths = []string{
 	// with no Authorization header — see AppRedirectHandler. Without this,
 	// every such click 401'd before ever reaching the handler.
 	"/app/",
+	// Workspace Settings' Terraform Version dropdown fetches this before the
+	// user necessarily has a session (e.g. right after Dex redirect) — see
+	// ReleasesHandler. "/tofu/index.json" is the equivalent path for OpenTofu,
+	// already covered by publicPrefixPaths below.
+	"/terraform/index.json",
 }
 
 var publicPrefixPaths = []string{

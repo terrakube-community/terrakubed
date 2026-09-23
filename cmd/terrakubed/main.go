@@ -145,6 +145,12 @@ func startAPI(cfg *config.Config) {
 		ExecutorImage:          cfg.ExecutorImage,
 		ExecutorSecretName:     cfg.ExecutorSecretName,
 		ExecutorServiceAccount: cfg.ExecutorServiceAccount,
+
+		// Terraform/OpenTofu version dropdown
+		TerraformReleasesUrl:       cfg.TerraformReleasesUrl,
+		TofuReleasesUrl:            cfg.TofuReleasesUrl,
+		TofuGithubToken:            cfg.TofuGithubToken,
+		ReleaseCacheExpirationMins: cfg.ReleaseCacheExpirationMinutes,
 	}
 
 	server, err := api.NewServer(apiConfig)
