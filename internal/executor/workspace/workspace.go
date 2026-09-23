@@ -192,6 +192,25 @@ func (w *Workspace) persistSSHKey() error {
 		return nil
 	}
 
+	// Diagnostics only — header/footer are standard PEM/OpenSSH markers, not
+	// secret. The two hardening attempts already shipped (OpenSSL legacy
+	// provider, CRLF normalization) didn't fix the reported "error in
+	// libcrypto", so log enough shape info to tell format from corruption
+	// without ever printing key material itself.
+	firstLine := keyContent
+	if idx := strings.Index(keyContent, "\n"); idx >= 0 {
+		firstLine = keyContent[:idx]
+	}
+	trimmed := strings.TrimRight(keyContent, "\n")
+	lastLine := trimmed
+	if idx := strings.LastIndex(trimmed, "\n"); idx >= 0 {
+		lastLine = trimmed[idx+1:]
+	}
+	log.Printf("SSH key diagnostics: length=%d lines=%d header=%q footer=%q hasCR=%v hasTab=%v leadingSpace=%v",
+		len(keyContent), strings.Count(keyContent, "\n")+1, firstLine, lastLine,
+		strings.Contains(keyContent, "\r"), strings.Contains(keyContent, "\t"),
+		len(keyContent) > 0 && (keyContent[0] == ' ' || keyContent[0] == '\t'))
+
 	keyFile, err := os.CreateTemp("", "terrakube-ssh-*")
 	if err != nil {
 		return fmt.Errorf("create temp key file: %w", err)
