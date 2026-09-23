@@ -41,7 +41,7 @@ func NewAzureStorageService(accountName, accountKey, containerName, hostname str
 	}, nil
 }
 
-func (s *AzureStorageService) SearchModule(org, module, provider, version, source, vcsType, accessToken, tagPrefix, folder string) (string, error) {
+func (s *AzureStorageService) SearchModule(org, module, provider, version, source, vcsType, connectionType, accessToken, tagPrefix, folder string) (string, error) {
 	key := fmt.Sprintf("registry/%s/%s/%s/%s/module.zip", org, module, provider, version)
 	path := fmt.Sprintf("%s/terraform/modules/v1/download/%s/%s/%s/%s/module.zip", s.Hostname, org, module, provider, version)
 
@@ -58,7 +58,7 @@ func (s *AzureStorageService) SearchModule(org, module, provider, version, sourc
 	log.Printf("Module %s not found in Azure storage, initiating clone...", key)
 
 	// Clone
-	cloneDir, err := s.GitService.CloneRepository(source, version, vcsType, accessToken, tagPrefix, folder)
+	cloneDir, err := s.GitService.CloneRepository(source, version, vcsType, connectionType, accessToken, tagPrefix, folder)
 	if err != nil {
 		return "", fmt.Errorf("failed to clone repository: %w", err)
 	}

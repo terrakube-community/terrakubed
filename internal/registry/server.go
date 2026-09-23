@@ -254,11 +254,13 @@ func Start(cfg *config.Config) {
 		folder := moduleDetails.Folder
 		tagPrefix := moduleDetails.TagPrefix
 		vcsType := "PUBLIC"
+		connectionType := ""
 		accessToken := ""
 
 		if moduleDetails.Vcs != nil && len(moduleDetails.Vcs.Edges) > 0 {
 			vcsNode := moduleDetails.Vcs.Edges[0].Node
 			vcsType = vcsNode.VcsType
+			connectionType = vcsNode.ConnectionType
 
 			token, err := apiClient.GetVcsToken(orgId, vcsNode.ID)
 			if err == nil {
@@ -272,7 +274,7 @@ func Start(cfg *config.Config) {
 			accessToken = sshNode.PrivateKey
 		}
 
-		path, err := storageService.SearchModule(org, name, provider, version, source, vcsType, accessToken, tagPrefix, folder)
+		path, err := storageService.SearchModule(org, name, provider, version, source, vcsType, connectionType, accessToken, tagPrefix, folder)
 		if err != nil {
 			log.Printf("Error searching/processing module: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process module download"})
