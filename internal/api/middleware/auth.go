@@ -97,6 +97,10 @@ var publicPaths = []string{
 	"/webhook/v1/",
 	"/remote/tfe/v2/ping",
 	"/health",
+	// Slack (and other integrations) link straight to this redirect pivot
+	// with no Authorization header — see AppRedirectHandler. Without this,
+	// every such click 401'd before ever reaching the handler.
+	"/app/",
 }
 
 var publicPrefixPaths = []string{
