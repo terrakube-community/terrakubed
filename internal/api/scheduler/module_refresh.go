@@ -5,6 +5,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,6 +13,12 @@ import (
 	"github.com/terrakube-community/terrakubed/internal/api/vcs"
 	"github.com/terrakube-community/terrakubed/internal/git"
 )
+
+// maxConcurrentModuleRefreshes bounds how many modules are refreshed at
+// once. Each refresh shells out to `git ls-remote` against a possibly slow
+// or unreachable remote, so refreshing modules one at a time let a single
+// bad repo hold up every other module's refresh for that whole tick.
+const maxConcurrentModuleRefreshes = 5
 
 // ModuleRefreshScheduler periodically checks each module's source repository
 // for new tags and records them as module_version rows, mirroring Java's
@@ -92,9 +99,18 @@ func (s *ModuleRefreshScheduler) refreshAll(ctx context.Context) {
 	}
 	rows.Close()
 
+	sem := make(chan struct{}, maxConcurrentModuleRefreshes)
+	var wg sync.WaitGroup
 	for _, m := range modules {
-		s.refreshModule(ctx, m)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(m moduleRow) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			s.refreshModule(ctx, m)
+		}(m)
 	}
+	wg.Wait()
 }
 
 func (s *ModuleRefreshScheduler) refreshModule(ctx context.Context, m moduleRow) {

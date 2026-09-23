@@ -392,6 +392,133 @@ func (r *GenericRepository) FindByID(ctx context.Context, resourceType string, i
 	return row, nil
 }
 
+// FindByIDs returns every row whose primary key is in the given list, in a
+// single query — the batched counterpart to FindByID. Used to resolve a
+// to-one relationship across many parent rows at once (e.g. workspace.vcs
+// for a whole page of workspaces) instead of one FindByID call per row.
+func (r *GenericRepository) FindByIDs(ctx context.Context, resourceType string, ids []string) ([]map[string]interface{}, error) {
+	meta, ok := r.resources[resourceType]
+	if !ok {
+		return nil, fmt.Errorf("unknown resource type: %s", resourceType)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	sb.WriteString(strings.Join(meta.Columns, ", "))
+	sb.WriteString(" FROM ")
+	sb.WriteString(meta.Table)
+	sb.WriteString(fmt.Sprintf(" WHERE %s IN (%s)", meta.PKColumn, strings.Join(placeholders, ", ")))
+
+	if meta.SoftDeleteColumn != "" {
+		sb.WriteString(fmt.Sprintf(" AND %s IS NOT TRUE", meta.SoftDeleteColumn))
+	}
+
+	rows, err := r.pool.Query(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("query failed: %w", err)
+	}
+	defer rows.Close()
+
+	results, err := scanRows(rows, meta.Columns)
+	if err != nil {
+		return nil, err
+	}
+	if meta.SensitiveFlagColumn != "" {
+		for _, row := range results {
+			maskSensitive(row, meta.SensitiveFlagColumn, meta.SensitiveMaskColumns)
+		}
+	}
+	return results, nil
+}
+
+// ListByParentFKs returns every row whose FK column matches any of the given
+// parent IDs, in a single query — the batched counterpart to List's single
+// ParentFK/ParentID filter. Used to resolve a to-many relationship across
+// many parent rows at once (e.g. module.version for a whole page of
+// modules) instead of one List call per parent row.
+func (r *GenericRepository) ListByParentFKs(ctx context.Context, resourceType, fkColumn string, parentIDs []string, columns []string, sort string) ([]map[string]interface{}, error) {
+	meta, ok := r.resources[resourceType]
+	if !ok {
+		return nil, fmt.Errorf("unknown resource type: %s", resourceType)
+	}
+	if len(parentIDs) == 0 {
+		return nil, nil
+	}
+	if !isSafeColumnName(fkColumn) {
+		return nil, fmt.Errorf("unsafe FK column name: %s", fkColumn)
+	}
+
+	selectCols := meta.Columns
+	if len(columns) > 0 {
+		selectCols = columns
+	}
+
+	placeholders := make([]string, len(parentIDs))
+	args := make([]interface{}, len(parentIDs))
+	for i, id := range parentIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	sb.WriteString(strings.Join(selectCols, ", "))
+	sb.WriteString(" FROM ")
+	sb.WriteString(meta.Table)
+	sb.WriteString(fmt.Sprintf(" WHERE %s IN (%s)", fkColumn, strings.Join(placeholders, ", ")))
+
+	if meta.SoftDeleteColumn != "" {
+		sb.WriteString(fmt.Sprintf(" AND %s IS NOT TRUE", meta.SoftDeleteColumn))
+	}
+
+	// Order by the FK column first so rows for the same parent stay
+	// contiguous, then by the requested sort (if any) within each group —
+	// this reproduces the same per-parent ordering the old one-query-per-
+	// parent approach gave for free.
+	if sort != "" {
+		desc := strings.HasPrefix(sort, "-")
+		col := camelToSnakeRepo(strings.TrimPrefix(sort, "-"))
+		if isSafeColumnName(col) {
+			dir := "ASC"
+			if desc {
+				dir = "DESC"
+			}
+			sb.WriteString(fmt.Sprintf(" ORDER BY %s, %s %s", fkColumn, col, dir))
+		} else {
+			sb.WriteString(fmt.Sprintf(" ORDER BY %s", fkColumn))
+		}
+	} else {
+		sb.WriteString(fmt.Sprintf(" ORDER BY %s", fkColumn))
+	}
+
+	rows, err := r.pool.Query(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("query failed: %w", err)
+	}
+	defer rows.Close()
+
+	results, err := scanRows(rows, selectCols)
+	if err != nil {
+		return nil, err
+	}
+	if meta.SensitiveFlagColumn != "" {
+		for _, row := range results {
+			maskSensitive(row, meta.SensitiveFlagColumn, meta.SensitiveMaskColumns)
+		}
+	}
+	return results, nil
+}
+
 // Create inserts a new row and returns the generated ID.
 func (r *GenericRepository) Create(ctx context.Context, resourceType string, data map[string]interface{}) (interface{}, error) {
 	meta, ok := r.resources[resourceType]
