@@ -331,6 +331,11 @@ func (h *JSONAPIHandler) handleRelated(w http.ResponseWriter, r *http.Request, p
 				if err := h.tclProcessor.InitJobSteps(context.WithoutCancel(r.Context()), jobID); err != nil {
 					log.Printf("TCL step init failed for nested job %d: %v", jobID, err)
 				}
+				if h.pool != nil {
+					h.pool.Exec(context.WithoutCancel(r.Context()),
+						`UPDATE workspace SET last_job_status = 'pending', last_job_date = NOW()
+						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID)
+				}
 			}
 		}
 
@@ -691,6 +696,11 @@ func (h *JSONAPIHandler) atomicAdd(r *http.Request, resourceType string, config 
 			if err2 := h.tclProcessor.InitJobSteps(context.WithoutCancel(r.Context()), jobID); err2 != nil {
 				log.Printf("Atomic add: TCL step init failed for job %d: %v", jobID, err2)
 			}
+			if h.pool != nil {
+				h.pool.Exec(context.WithoutCancel(r.Context()),
+					`UPDATE workspace SET last_job_status = 'pending', last_job_date = NOW()
+					 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID)
+			}
 		}
 	}
 
@@ -726,6 +736,16 @@ func (h *JSONAPIHandler) atomicUpdate(r *http.Request, resourceType string, conf
 				go func(jobID interface{}, status string) {
 					h.pool.Exec(context.Background(),
 						`UPDATE workspace SET locked = false, last_job_status = $2, last_job_date = NOW()
+						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID, status)
+				}(id, newStatus)
+			default:
+				// Non-terminal transition (approved, queue, running, waitingApproval, …).
+				// See the matching `default` block in updateResource for why this is
+				// needed — mirrors Java's JobManageHook firing on every job status
+				// change, not just terminal ones. Never touches `locked`.
+				go func(jobID interface{}, status string) {
+					h.pool.Exec(context.Background(),
+						`UPDATE workspace SET last_job_status = $2, last_job_date = NOW()
 						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID, status)
 				}(id, newStatus)
 			}
@@ -1052,6 +1072,11 @@ func (h *JSONAPIHandler) createResource(w http.ResponseWriter, r *http.Request, 
 			if err := h.tclProcessor.InitJobSteps(context.WithoutCancel(r.Context()), jobID); err != nil {
 				log.Printf("TCL step init failed for job %d: %v", jobID, err)
 			}
+			if h.pool != nil {
+				h.pool.Exec(context.WithoutCancel(r.Context()),
+					`UPDATE workspace SET last_job_status = 'pending', last_job_date = NOW()
+					 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID)
+			}
 		}
 	}
 
@@ -1187,8 +1212,20 @@ func (h *JSONAPIHandler) updateResource(w http.ResponseWriter, r *http.Request, 
 						log.Printf("Job %v terminal state %q — workspace unlocked", jobID, status)
 					}
 				}(id, newStatus)
-			case "running":
-				// no workspace column update needed for running state
+			default:
+				// Non-terminal transition (approved, queue, running, waitingApproval, …)
+				// reaching us via a direct PATCH — e.g. the UI's Approve button, which
+				// PATCHes job.status to 'approved' with no dedicated endpoint. Mirrors
+				// Java's JobManageHook, which updates workspace.lastJobStatus/lastJobDate
+				// on every job status change, not just terminal ones — without this the
+				// workspace list freezes on the last terminal status and never shows
+				// "Running" or "Awaiting approval" while a job is actually in progress.
+				// Unlike the terminal case above, this never touches `locked`.
+				go func(jobID interface{}, status string) {
+					h.pool.Exec(context.Background(),
+						`UPDATE workspace SET last_job_status = $2, last_job_date = NOW()
+						 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID, status)
+				}(id, newStatus)
 			}
 		}
 	}

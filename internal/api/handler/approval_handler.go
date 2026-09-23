@@ -80,6 +80,13 @@ func (h *ApprovalHandler) approve(w http.ResponseWriter, r *http.Request, jobID 
 		return
 	}
 
+	// Mirrors Java's JobManageHook firing on every job status change, not just
+	// terminal ones — without this the workspace list stays frozen on the last
+	// terminal status through the wait for apply/destroy to actually start.
+	h.pool.Exec(ctx,
+		`UPDATE workspace SET last_job_status = 'queue', last_job_date = NOW()
+		 WHERE id = (SELECT workspace_id FROM job WHERE id = $1)`, jobID)
+
 	log.Printf("Job %s approved — re-queued for next step", jobID)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
