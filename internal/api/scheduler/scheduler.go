@@ -218,13 +218,25 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		       COALESCE(NULLIF(j.override_source,''), w.source),
 		       COALESCE(NULLIF(j.override_branch,''), w.branch),
 		       w.folder, w.terraform_version, w.iac_type,
-		       w.module_ssh_key, w.name,
-		       COALESCE(v.vcs_type,''), COALESCE(v.connection_type,''), COALESCE(v.access_token,''),
+		       COALESCE(ms.private_key,''), w.name,
+		       COALESCE(v.vcs_type, CASE WHEN s.id IS NOT NULL THEN 'SSH~' || s.ssh_type ELSE '' END, ''),
+		       COALESCE(v.connection_type,''),
+		       COALESCE(v.access_token, s.private_key, ''),
 		       COALESCE(w.vcs_id::text,''),
 		       COALESCE(a.url,'')
 		FROM job j
 		JOIN workspace w ON j.workspace_id = w.id
 		LEFT JOIN vcs v ON w.vcs_id = v.id
+		LEFT JOIN ssh s ON w.ssh_id = s.id
+		-- workspace.module_ssh_key is NOT the key content — it's the id of a
+		-- separate "ssh" row (matches Java's ExecutorService.java: it looks up
+		-- sshRepository.findById(moduleSshId) and sends the resolved
+		-- private_key, never the raw column value). Without this join, the raw
+		-- UUID string was written straight to the SSH key file and fed to the
+		-- system ssh client, which understandably can't parse a UUID as key
+		-- material ("error in libcrypto") — this, not any OpenSSL/Alpine
+		-- quirk, was the actual cause of every git+ssh module download failure.
+		LEFT JOIN ssh ms ON ms.id::text = w.module_ssh_key
 		LEFT JOIN agent a ON w.agent_id = a.id
 		WHERE (j.status = 'pending')
 		   OR (j.status = 'approved')
@@ -253,7 +265,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			folder           *string
 			terraformVersion *string
 			iacType          *string
-			moduleSshKey     *string
+			moduleSshKey     string
 			workspaceName    string
 			vcsType          string
 			connectionType   string
@@ -435,7 +447,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 			VcsType:          vcsType,
 			ConnectionType:   connectionType,
 			AccessToken:      freshToken,
-			ModuleSshKey:     deref(moduleSshKey),
+			ModuleSshKey:     moduleSshKey,
 			CommitID:         deref(commitID),
 			Refresh:          refresh,
 			RefreshOnly:      refreshOnly,
