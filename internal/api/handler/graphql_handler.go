@@ -251,6 +251,19 @@ func (h *GraphQLHandler) resolveRelationship(ctx context.Context, parentID strin
 	for _, f := range rel.fields {
 		colSet[camelToSnake(f)] = true
 	}
+	// Also include FK columns needed by nested sub-relationships (e.g. "vcs"/
+	// "ssh" requested inside "module"). Without this, the recursive
+	// resolveRelationship call below receives a row that never had that FK
+	// column selected at all — a missing map key reads back as nil, so a
+	// genuinely-set FK (module.vcs_id) was reported as "no relationship",
+	// even though the DB column was populated all along.
+	if childMeta != nil {
+		for _, subRel := range rel.rels {
+			if parentSubRel, ok := childMeta.Parents[subRel.name]; ok {
+				colSet[parentSubRel.FKColumn] = true
+			}
+		}
+	}
 	selectCols := make([]string, 0, len(colSet))
 	for c := range colSet {
 		selectCols = append(selectCols, c)
