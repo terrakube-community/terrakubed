@@ -107,6 +107,8 @@ const getModuleQuery = `
                             node {
                                 id
                                 clientId
+                                vcsType
+                                connectionType
                             }
                         }
                     }
@@ -134,9 +136,10 @@ type ModuleDetails struct {
 	Vcs       *struct {
 		Edges []struct {
 			Node struct {
-				ID       string `json:"id"`
-				VcsType  string `json:"vcsType"`
-				ClientID string `json:"clientId"`
+				ID             string `json:"id"`
+				VcsType        string `json:"vcsType"`
+				ClientID       string `json:"clientId"`
+				ConnectionType string `json:"connectionType"`
 			} `json:"node"`
 		} `json:"edges"`
 	} `json:"vcs"`

@@ -9,7 +9,7 @@ import (
 )
 
 type GitService interface {
-	CloneRepository(source, version, vcsType, accessToken, tagPrefix, folder string) (string, error)
+	CloneRepository(source, version, vcsType, connectionType, accessToken, tagPrefix, folder string) (string, error)
 }
 
 type Service struct{}
@@ -81,13 +81,13 @@ func setupSSHEnv(vcsType, accessToken, tempDir string) ([]string, func(), error)
 	return env, cleanup, nil
 }
 
-func (s *Service) CloneRepository(source, version, vcsType, accessToken, tagPrefix, folder string) (string, error) {
+func (s *Service) CloneRepository(source, version, vcsType, connectionType, accessToken, tagPrefix, folder string) (string, error) {
 	tempDir, err := os.MkdirTemp("", "terrakube-registry")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp dir: %w", err)
 	}
 
-	repoURL := setupCredentialURL(source, vcsType, "", accessToken)
+	repoURL := setupCredentialURL(source, vcsType, connectionType, accessToken)
 
 	env, sshCleanup, err := setupSSHEnv(vcsType, accessToken, tempDir)
 	if err != nil {

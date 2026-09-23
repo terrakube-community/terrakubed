@@ -13,7 +13,7 @@ func (s *NopStorageService) DownloadFile(path string) (io.ReadCloser, error) {
 	return nil, fmt.Errorf("no storage configured (NopStorageService)")
 }
 
-func (s *NopStorageService) SearchModule(org, module, provider, version, source, vcsType, accessToken, tagPrefix, folder string) (string, error) {
+func (s *NopStorageService) SearchModule(org, module, provider, version, source, vcsType, connectionType, accessToken, tagPrefix, folder string) (string, error) {
 	return "", fmt.Errorf("SearchModule not supported in NopStorageService")
 }
 

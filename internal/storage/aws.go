@@ -75,7 +75,7 @@ func NewAWSStorageService(ctx context.Context, region, bucket, hostname, endpoin
 	}, nil
 }
 
-func (s *AWSStorageService) SearchModule(org, module, provider, version, source, vcsType, accessToken, tagPrefix, folder string) (string, error) {
+func (s *AWSStorageService) SearchModule(org, module, provider, version, source, vcsType, connectionType, accessToken, tagPrefix, folder string) (string, error) {
 	key := fmt.Sprintf("registry/%s/%s/%s/%s/module.zip", org, module, provider, version)
 	path := fmt.Sprintf("%s/terraform/modules/v1/download/%s/%s/%s/%s/module.zip", s.Hostname, org, module, provider, version)
 
@@ -92,7 +92,7 @@ func (s *AWSStorageService) SearchModule(org, module, provider, version, source,
 	log.Printf("Module %s not found in storage, initiating clone...", key)
 
 	// Clone
-	cloneDir, err := s.GitService.CloneRepository(source, version, vcsType, accessToken, tagPrefix, folder)
+	cloneDir, err := s.GitService.CloneRepository(source, version, vcsType, connectionType, accessToken, tagPrefix, folder)
 	if err != nil {
 		return "", fmt.Errorf("failed to clone repository: %w", err)
 	}
