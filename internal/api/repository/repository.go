@@ -446,7 +446,7 @@ func (r *GenericRepository) FindByIDs(ctx context.Context, resourceType string, 
 // ParentFK/ParentID filter. Used to resolve a to-many relationship across
 // many parent rows at once (e.g. module.version for a whole page of
 // modules) instead of one List call per parent row.
-func (r *GenericRepository) ListByParentFKs(ctx context.Context, resourceType, fkColumn string, parentIDs []string, columns []string, sort string) ([]map[string]interface{}, error) {
+func (r *GenericRepository) ListByParentFKs(ctx context.Context, resourceType, fkColumn string, parentIDs []string, columns []string, sort string, filters map[string]interface{}) ([]map[string]interface{}, error) {
 	meta, ok := r.resources[resourceType]
 	if !ok {
 		return nil, fmt.Errorf("unknown resource type: %s", resourceType)
@@ -469,6 +469,7 @@ func (r *GenericRepository) ListByParentFKs(ctx context.Context, resourceType, f
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
 		args[i] = id
 	}
+	argIdx := len(parentIDs) + 1
 
 	var sb strings.Builder
 	sb.WriteString("SELECT ")
@@ -479,6 +480,29 @@ func (r *GenericRepository) ListByParentFKs(ctx context.Context, resourceType, f
 
 	if meta.SoftDeleteColumn != "" {
 		sb.WriteString(fmt.Sprintf(" AND %s IS NOT TRUE", meta.SoftDeleteColumn))
+	}
+
+	// Additional filters — e.g. from a nested relationship's `filter:` arg
+	// (see resolveToManyBatch), such as module(filter: "name=='x';provider=='y'").
+	// Column names are validated the same way List() validates its own filters.
+	for col, val := range filters {
+		if !isSafeColumnName(col) {
+			log.Printf("ListByParentFKs(%s): ignoring filter with unsafe column name %q", resourceType, col)
+			continue
+		}
+		switch v := val.(type) {
+		case []string:
+			if len(v) == 0 {
+				continue
+			}
+			sb.WriteString(fmt.Sprintf(" AND %s = ANY($%d::text[])", col, argIdx))
+			args = append(args, v)
+			argIdx++
+		default:
+			sb.WriteString(fmt.Sprintf(" AND %s = $%d", col, argIdx))
+			args = append(args, val)
+			argIdx++
+		}
 	}
 
 	// Order by the FK column first so rows for the same parent stay

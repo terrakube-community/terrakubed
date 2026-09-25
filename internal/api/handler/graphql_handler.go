@@ -334,7 +334,20 @@ func (h *GraphQLHandler) resolveToManyBatch(ctx context.Context, parentIDs []str
 		selectCols = append(selectCols, c)
 	}
 
-	childRows, err := h.repo.ListByParentFKs(ctx, childRel.ChildType, childRel.FKColumn, parentIDs, selectCols, rel.sort)
+	// A filter arg on a nested relationship — e.g. organization { module
+	// (filter: "name=='x';provider=='y'") { ... } } — was parsed but never
+	// applied: relInfo had no field to carry it, so every request for a
+	// specific module (by name+provider) silently got back every module in
+	// the organization instead, and callers like GetModule (registry's
+	// module download path) that just take the first edge would use
+	// whichever module happened to sort first — a completely different
+	// module's source repo, wrong VCS credentials, etc.
+	var filters map[string]interface{}
+	if rel.filter != "" {
+		filters = parseElideFilter(rel.filter, childMeta)
+	}
+
+	childRows, err := h.repo.ListByParentFKs(ctx, childRel.ChildType, childRel.FKColumn, parentIDs, selectCols, rel.sort, filters)
 	if err != nil {
 		return nil, err
 	}
@@ -567,6 +580,7 @@ func parseInlineData(body string, data map[string]interface{}) {
 type relInfo struct {
 	name   string
 	sort   string    // e.g. "name" or "-name" (from sort: "name" arg)
+	filter string    // raw Elide filter expression, e.g. "name=='x';provider=='y'" (from filter: "..." arg)
 	fields []string
 	rels   []relInfo // nested relationships
 }
@@ -839,12 +853,12 @@ func parseNodeBody(body string) (fields []string, rels []relInfo) {
 		}
 
 		// Parse optional arguments: (sort: "name", filter: ...)
-		// We capture sort so child relationships can be ordered correctly.
-		var relSort string
+		var relSort, relFilter string
 		if i < len(body) && body[i] == '(' {
 			// Extract the args content
 			argsContent := extractParenContent(body, i)
 			relSort = parseSortArg(argsContent)
+			relFilter = parseFilterArg(argsContent)
 			// Advance past the closing paren
 			depth := 0
 			for i < len(body) {
@@ -889,7 +903,7 @@ func parseNodeBody(body string) (fields []string, rels []relInfo) {
 			relNodeBody := findNodeBody(content)
 			if relNodeBody != "" {
 				relFields, subRels := parseNodeBody(relNodeBody)
-				rels = append(rels, relInfo{name: word, sort: relSort, fields: relFields, rels: subRels})
+				rels = append(rels, relInfo{name: word, sort: relSort, filter: relFilter, fields: relFields, rels: subRels})
 			}
 		} else {
 			// It's a scalar field
