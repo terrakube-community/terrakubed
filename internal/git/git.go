@@ -2,11 +2,28 @@ package git
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 )
+
+// redactURL masks any embedded userinfo (user:token@ or token@) in a git
+// remote URL so it's safe to log — used only for diagnostics, never for the
+// actual command.
+func redactURL(u string) string {
+	idx := strings.Index(u, "://")
+	if idx < 0 {
+		return u
+	}
+	rest := u[idx+3:]
+	at := strings.Index(rest, "@")
+	if at < 0 {
+		return u
+	}
+	return u[:idx+3] + "REDACTED@" + rest[at+1:]
+}
 
 type GitService interface {
 	CloneRepository(source, version, vcsType, connectionType, accessToken, tagPrefix, folder string) (string, error)
@@ -107,12 +124,16 @@ func (s *Service) CloneRepository(source, version, vcsType, connectionType, acce
 	// "0.10.2".
 	bareVersion := strings.TrimPrefix(version, "v")
 
+	log.Printf("CloneRepository diagnostics: source=%q repoURL=%q vcsType=%q tagPrefix=%q version=%q bareVersion=%q",
+		source, redactURL(repoURL), vcsType, tagPrefix, version, bareVersion)
+
 	// Try tag with "v" prefix first, then without
 	tag := tagPrefix + "v" + bareVersion
 	cloneCmd := exec.Command("git", "clone", "--depth", "1", "--branch", tag, repoURL, tempDir)
 	cloneCmd.Env = env
 
-	if _, err := cloneCmd.CombinedOutput(); err != nil {
+	if output, err := cloneCmd.CombinedOutput(); err != nil {
+		log.Printf("CloneRepository: first attempt (tag=%q) failed: %s", tag, string(output))
 		tag = tagPrefix + bareVersion
 		os.RemoveAll(tempDir)
 		tempDir, _ = os.MkdirTemp("", "terrakube-registry")
