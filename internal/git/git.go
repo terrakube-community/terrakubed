@@ -98,13 +98,22 @@ func (s *Service) CloneRepository(source, version, vcsType, connectionType, acce
 	}
 	defer sshCleanup()
 
+	// version can already carry a leading "v": when a module has no
+	// tag_prefix configured, ModuleRefreshScheduler stores the full tag name
+	// (including any "v") verbatim as the version string. Stripping it before
+	// guessing keeps the two attempts below meaningfully distinct — without
+	// this, a version of "v0.10.2" turned both attempts into the same
+	// doomed "vv0.10.2"/"v0.10.2" pair instead of trying "v0.10.2" and
+	// "0.10.2".
+	bareVersion := strings.TrimPrefix(version, "v")
+
 	// Try tag with "v" prefix first, then without
-	tag := tagPrefix + "v" + version
+	tag := tagPrefix + "v" + bareVersion
 	cloneCmd := exec.Command("git", "clone", "--depth", "1", "--branch", tag, repoURL, tempDir)
 	cloneCmd.Env = env
 
 	if _, err := cloneCmd.CombinedOutput(); err != nil {
-		tag = tagPrefix + version
+		tag = tagPrefix + bareVersion
 		os.RemoveAll(tempDir)
 		tempDir, _ = os.MkdirTemp("", "terrakube-registry")
 		cloneCmd = exec.Command("git", "clone", "--depth", "1", "--branch", tag, repoURL, tempDir)
