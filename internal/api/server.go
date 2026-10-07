@@ -205,7 +205,13 @@ func NewServer(config Config) (*Server, error) {
 	// Custom endpoints
 	mux.HandleFunc("/logs/", logsHandler.AppendLogs)
 	mux.HandleFunc("/tfoutput/v1/", outputHandler.GetOutput)
-	mux.HandleFunc("/context/v1/", contextHandler.GetContext)
+	mux.HandleFunc("/context/v1/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			contextHandler.SaveContext(w, r)
+			return
+		}
+		contextHandler.GetContext(w, r)
+	})
 
 	// Token management endpoints (PAT + Team tokens)
 	patHandler := handler.NewPatHandler(db.Pool, config.PatSecret)
