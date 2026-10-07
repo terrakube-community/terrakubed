@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -202,4 +203,49 @@ func (h *ContextHandler) GetContext(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(data)
+}
+
+// SaveContext handles POST /context/v1/{jobId}. The executor posts back a
+// merged context document (its own GET of this same endpoint, with this
+// step's planStructuredOutput/terrakubeUI entries added — see
+// uploadPlanJSON/saveContext in internal/executor/core/executor_upload.go)
+// after each Plan/PlanDestroy step.
+//
+// This handler never existed: the GET-merge-POST round trip was introduced
+// for structured plan data, but nothing was ever registered to accept the
+// POST, so every call 405'd. The executor only logs that failure and keeps
+// going (a job's success doesn't depend on it), so this failed silently on
+// every single plan — planStructuredOutput never actually persisted, and
+// the UI's "Changes" view always fell back to the raw log viewer instead of
+// the colored add/change/destroy summary.
+func (h *ContextHandler) SaveContext(w http.ResponseWriter, r *http.Request) {
+	jobId := strings.TrimPrefix(r.URL.Path, "/context/v1/")
+	if jobId == "" || strings.Contains(jobId, "/") {
+		http.Error(w, "invalid path — expected /context/v1/{jobId}", http.StatusBadRequest)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "failed to read body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	// Validate it's well-formed JSON before persisting — the executor always
+	// sends a full object (its merged context), never arbitrary bytes.
+	var ctx map[string]interface{}
+	if err := json.Unmarshal(body, &ctx); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	remotePath := fmt.Sprintf("tfplan/%s/context.json", jobId)
+	if err := h.storage.UploadFile(remotePath, bytes.NewReader(body)); err != nil {
+		log.Printf("Failed to save plan context for job %s: %v", jobId, err)
+		http.Error(w, "failed to save context", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
