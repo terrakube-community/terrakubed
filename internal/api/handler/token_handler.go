@@ -119,7 +119,12 @@ func (h *PatHandler) createToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signingKey := []byte(h.patSecret)
+	signingKey, err := middleware.HMACSigningKey(h.patSecret)
+	if err != nil {
+		log.Printf("PatSecret is not valid base64url: %v", err)
+		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+		return
+	}
 	tokenString, err := token.SignedString(signingKey)
 	if err != nil {
 		log.Printf("Failed to sign PAT JWT: %v", err)
@@ -461,7 +466,13 @@ func (h *TeamTokenHandler) createToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString([]byte(h.patSecret))
+	signingKey, err := middleware.HMACSigningKey(h.patSecret)
+	if err != nil {
+		log.Printf("PatSecret is not valid base64url: %v", err)
+		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+		return
+	}
+	tokenString, err := token.SignedString(signingKey)
 	if err != nil {
 		log.Printf("Failed to sign team token: %v", err)
 		http.Error(w, "Failed to generate token", http.StatusInternalServerError)

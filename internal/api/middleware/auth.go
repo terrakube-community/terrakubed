@@ -349,6 +349,14 @@ func verifyHMACToken(token string, secretBase64URL string) error {
 	return nil
 }
 
+// HMACSigningKey returns the HMAC key for a base64url-encoded secret. Tokens
+// must be signed with this (not the raw secret string) because
+// verifyHMACToken decodes the secret before using it as the key — and so does
+// Java, which is what originally minted the PATs this deployment still honors.
+func HMACSigningKey(secretBase64URL string) ([]byte, error) {
+	return base64URLDecode(secretBase64URL)
+}
+
 func base64URLDecode(s string) ([]byte, error) {
 	// Add padding if necessary
 	switch len(s) % 4 {
