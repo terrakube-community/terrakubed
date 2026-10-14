@@ -262,6 +262,57 @@ func tfeWorkspaceResource(wsID, name string, locked bool, terraformVersion *stri
 	}
 }
 
+// parseWorkspaceLockPath matches workspaces/{id}/actions/{lock|unlock}.
+func parseWorkspaceLockPath(parts []string) (wsID, action string, ok bool) {
+	if len(parts) == 4 && parts[0] == "workspaces" && parts[1] != "" && parts[2] == "actions" &&
+		(parts[3] == "lock" || parts[3] == "unlock") {
+		return parts[1], parts[3], true
+	}
+	return "", "", false
+}
+
+// setWorkspaceLock locks or unlocks a workspace, mirroring Java's
+// RemoteTfeController: locking an already-locked workspace is a 409, and the
+// workspace resource is returned on success. Locking is a single conditional
+// UPDATE so two concurrent lockers can't both win.
+func (h *RemoteTFEHandler) setWorkspaceLock(w http.ResponseWriter, r *http.Request, wsID string, lock bool) {
+	query := `UPDATE workspace SET locked = $2
+	          WHERE id = $1 AND deleted = false`
+	if lock {
+		query += ` AND locked IS NOT TRUE`
+	}
+	query += ` RETURNING name, locked, terraform_version, COALESCE(allow_remote_apply, false)`
+
+	var name string
+	var locked, allowRemoteApply bool
+	var terraformVersion *string
+	err := h.pool.QueryRow(r.Context(), query, wsID, lock).Scan(&name, &locked, &terraformVersion, &allowRemoteApply)
+	if err != nil {
+		var exists bool
+		if lock {
+			_ = h.pool.QueryRow(r.Context(),
+				`SELECT EXISTS(SELECT 1 FROM workspace WHERE id = $1 AND deleted = false)`, wsID).Scan(&exists)
+		}
+		if exists {
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"errors": []map[string]string{{
+					"status": "409", "title": "conflict",
+					"detail": "Unable to lock workspace. The workspace is already locked.",
+				}},
+			})
+			return
+		}
+		http.Error(w, "Workspace not found", http.StatusNotFound)
+		return
+	}
+
+	log.Printf("TFE: workspace %s lock=%v via CLI", wsID, locked)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"data": tfeWorkspaceResource(wsID, name, locked, terraformVersion, allowRemoteApply),
+	})
+}
+
 func (h *RemoteTFEHandler) handleWorkspaces(w http.ResponseWriter, r *http.Request, path string) {
 	// GET /remote/tfe/v2/workspaces?search[name]=xxx
 	// This is used by terraform CLI to find workspace by name
@@ -293,6 +344,16 @@ func (h *RemoteTFEHandler) handleWorkspaces(w http.ResponseWriter, r *http.Reque
 		}
 		json.NewEncoder(w).Encode(doc)
 		return
+	}
+
+	// POST /workspaces/{id}/actions/lock|unlock — taken by the CLI around any
+	// command that writes state (`state rm`, `import`, ...). Missing, so
+	// those failed with "Error acquiring the state lock: resource not found".
+	if r.Method == http.MethodPost {
+		if wsID, action, ok := parseWorkspaceLockPath(parts); ok {
+			h.setWorkspaceLock(w, r, wsID, action == "lock")
+			return
+		}
 	}
 
 	// POST /workspaces/{id}/configuration-versions — the form the real
