@@ -313,6 +313,76 @@ func (h *RemoteTFEHandler) setWorkspaceLock(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// parseWorkspaceRunsPath matches workspaces/{id}/runs.
+func parseWorkspaceRunsPath(parts []string) (wsID string, ok bool) {
+	if len(parts) == 3 && parts[0] == "workspaces" && parts[1] != "" && parts[2] == "runs" {
+		return parts[1], true
+	}
+	return "", false
+}
+
+// writeActiveRunList renders the not-yet-finished runs matching cond (a SQL
+// condition on job j, with args) as a TFE runs list, mirroring Java's
+// getWorkspaceRuns / getRunsQueue: pending, queued, running and
+// waiting-for-approval jobs only. When withQueuePosition is set each run gets
+// a "position-in-queue" attribute (oldest first), as the CLI uses it to print
+// "Waiting for N run(s) to finish".
+func (h *RemoteTFEHandler) writeActiveRunList(w http.ResponseWriter, r *http.Request, cond string, arg interface{}, newestFirst, withQueuePosition bool) {
+	order := "ASC"
+	if newestFirst {
+		order = "DESC"
+	}
+	rows, err := h.pool.Query(r.Context(), `
+		SELECT j.id, j.status, j.workspace_id::text, j.tcl, COALESCE(j.auto_apply, false)
+		FROM job j
+		WHERE `+cond+` AND j.status IN ('pending','running','queue','waitingApproval')
+		ORDER BY j.id `+order, arg)
+	if err != nil {
+		log.Printf("TFE run list query failed: %v", err)
+		http.Error(w, "failed to list runs", http.StatusInternalServerError)
+		return
+	}
+	type activeRun struct {
+		id        int
+		status    string
+		wsID      string
+		tcl       *string
+		autoApply bool
+	}
+	var runs []activeRun
+	for rows.Next() {
+		var ar activeRun
+		if err := rows.Scan(&ar.id, &ar.status, &ar.wsID, &ar.tcl, &ar.autoApply); err != nil {
+			continue
+		}
+		runs = append(runs, ar)
+	}
+	rows.Close()
+
+	data := make([]interface{}, 0, len(runs))
+	for i, ar := range runs {
+		stepType := h.currentStepType(r.Context(), ar.id, derefStr(ar.tcl))
+		doc := h.buildRunDoc(fmt.Sprintf("run-%d", ar.id), ar.id, jobStatusToTFE(ar.status, stepType), ar.wsID, stepType, ar.autoApply)
+		item, _ := doc["data"].(map[string]interface{})
+		if withQueuePosition {
+			if attrs, ok := item["attributes"].(map[string]interface{}); ok {
+				attrs["position-in-queue"] = i
+			}
+		}
+		data = append(data, item)
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"data": data,
+		"meta": map[string]interface{}{
+			"pagination": map[string]interface{}{
+				"current-page": 1, "prev-page": nil, "next-page": nil,
+				"total-pages": 1, "total-count": len(data),
+			},
+		},
+	})
+}
+
 func (h *RemoteTFEHandler) handleWorkspaces(w http.ResponseWriter, r *http.Request, path string) {
 	// GET /remote/tfe/v2/workspaces?search[name]=xxx
 	// This is used by terraform CLI to find workspace by name
@@ -344,6 +414,16 @@ func (h *RemoteTFEHandler) handleWorkspaces(w http.ResponseWriter, r *http.Reque
 		}
 		json.NewEncoder(w).Encode(doc)
 		return
+	}
+
+	// GET /workspaces/{id}/runs — the CLI lists active runs right after
+	// creating one, to report queue position. Missing, so `terraform plan`
+	// died with "Failed to retrieve run list: resource not found".
+	if r.Method == http.MethodGet {
+		if wsID, ok := parseWorkspaceRunsPath(parts); ok {
+			h.writeActiveRunList(w, r, "j.workspace_id = $1", wsID, true, false)
+			return
+		}
 	}
 
 	// POST /workspaces/{id}/actions/lock|unlock — taken by the CLI around any
@@ -1330,6 +1410,14 @@ func (h *RemoteTFEHandler) handleOrganizations(w http.ResponseWriter, r *http.Re
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"data": tfeWorkspaceResource(wsID, parts[3], locked, terraformVersion, allowRemoteApply),
 		})
+		return
+	}
+
+	// GET /organizations/{org}/runs/queue — org-wide active runs, oldest first,
+	// with queue positions (Java: getRunsQueue).
+	if len(parts) == 4 && parts[2] == "runs" && parts[3] == "queue" {
+		h.writeActiveRunList(w, r,
+			"j.organization_id = (SELECT id FROM organization WHERE name = $1)", parts[1], false, true)
 		return
 	}
 
