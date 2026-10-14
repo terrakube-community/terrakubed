@@ -134,9 +134,19 @@ func (h *JSONAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(segments) == 3:
 		// /api/v1/{type}/{id}/{relationship} — List related or create child
 		h.handleRelated(w, r, segments[0], segments[1], segments[2])
-	case len(segments) == 4 && segments[2] == "relationships":
-		// /api/v1/{type}/{id}/relationships/{rel} — Relationship link
-		h.handleRelationshipLink(w, r, segments[0], segments[1], segments[3])
+	case len(segments) >= 4 && segments[len(segments)-2] == "relationships":
+		// .../{type}/{id}/relationships/{rel} — Relationship link, including
+		// after an arbitrary number of parent segments, e.g.
+		// organization/{orgId}/workspace/{wsId}/relationships/{rel}. The old
+		// check only matched exactly 4 segments (segments[2] == "relationships"),
+		// so any nested path reached the "deep nesting" fallback below instead,
+		// which has no concept of "relationships" and treated it as a resource
+		// type name — every relationship PATCH on a nested path 404'd with
+		// "Unknown resource type: relationships".
+		resourceType := segments[len(segments)-4]
+		resourceID := segments[len(segments)-3]
+		relName := segments[len(segments)-1]
+		h.handleRelationshipLink(w, r, resourceType, resourceID, relName)
 	default:
 		// Deep nesting: /api/v1/{t0}/{id0}/{t1}/{id1}[/{t2}/{id2}...]
 		// Elide-style: find the last type/id pair and operate on it.
