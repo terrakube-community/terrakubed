@@ -20,6 +20,17 @@ import (
 func AuthzMiddleware(pool *pgxpool.Pool, ownerGroup string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Paths AuthMiddleware deliberately lets through without a token
+			// (CLI config-version upload, state archive upload, webhooks, ...)
+			// never get a user in the context. Without this, the check below
+			// 401'd every such non-GET request before it reached its handler —
+			// e.g. `terraform plan` failed with "Failed to upload configuration
+			// files: error HTTP response: 401".
+			if isPublicPath(r.URL.Path, r.Method) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			// GET / OPTIONS / HEAD are always allowed for authenticated users
 			if r.Method == http.MethodGet || r.Method == http.MethodOptions ||
 				r.Method == http.MethodHead {
