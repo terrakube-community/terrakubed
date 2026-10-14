@@ -236,12 +236,12 @@ func (h *RemoteTFEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // tfeWorkspaceResource builds the TFE "workspaces" resource object shared by
 // the by-name lookup, the search/list endpoints and the legacy search shortcut.
-func tfeWorkspaceResource(wsID, name string, locked bool, terraformVersion *string, allowRemoteApply bool) map[string]interface{} {
+func tfeWorkspaceResource(wsID, name string, locked bool, terraformVersion *string, allowRemoteApply bool, workingDir string) map[string]interface{} {
 	tfVer := ""
 	if terraformVersion != nil {
 		tfVer = *terraformVersion
 	}
-	return map[string]interface{}{
+	res := map[string]interface{}{
 		"id":   wsID,
 		"type": "workspaces",
 		"attributes": map[string]interface{}{
@@ -260,6 +260,27 @@ func tfeWorkspaceResource(wsID, name string, locked bool, terraformVersion *stri
 			},
 		},
 	}
+	// Terraform CLI strips this suffix from the local config dir to decide what
+	// to upload. Without it only the (-chdir) directory is uploaded, so relative
+	// modules like ../../modules are missing on the remote side.
+	if workingDir != "" {
+		res["attributes"].(map[string]interface{})["working-directory"] = workingDir
+	}
+	return res
+}
+
+// tfeWorkingDirectory mirrors Java's RemoteTfeService: the first folder entry,
+// only when the workspace has a VCS or SSH connection and the folder isn't "/".
+func (h *RemoteTFEHandler) tfeWorkingDirectory(ctx context.Context, wsID string) string {
+	var dir string
+	err := h.pool.QueryRow(ctx,
+		`SELECT CASE WHEN vcs_id IS NOT NULL OR ssh_id IS NOT NULL
+		             THEN trim(split_part(COALESCE(folder, ''), ',', 1)) ELSE '' END
+		 FROM workspace WHERE id = $1`, wsID).Scan(&dir)
+	if err != nil || dir == "/" {
+		return ""
+	}
+	return dir
 }
 
 // parseWorkspaceLockPath matches workspaces/{id}/actions/{lock|unlock}.
@@ -309,7 +330,7 @@ func (h *RemoteTFEHandler) setWorkspaceLock(w http.ResponseWriter, r *http.Reque
 
 	log.Printf("TFE: workspace %s lock=%v via CLI", wsID, locked)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"data": tfeWorkspaceResource(wsID, name, locked, terraformVersion, allowRemoteApply),
+		"data": tfeWorkspaceResource(wsID, name, locked, terraformVersion, allowRemoteApply, h.tfeWorkingDirectory(r.Context(), wsID)),
 	})
 }
 
@@ -410,7 +431,7 @@ func (h *RemoteTFEHandler) handleWorkspaces(w http.ResponseWriter, r *http.Reque
 
 		_ = orgID
 		doc := map[string]interface{}{
-			"data": []map[string]interface{}{tfeWorkspaceResource(wsID, name, locked, terraformVersion, allowRemoteApply)},
+			"data": []map[string]interface{}{tfeWorkspaceResource(wsID, name, locked, terraformVersion, allowRemoteApply, h.tfeWorkingDirectory(r.Context(), wsID))},
 		}
 		json.NewEncoder(w).Encode(doc)
 		return
@@ -627,10 +648,14 @@ func (h *RemoteTFEHandler) createRun(w http.ResponseWriter, r *http.Request) {
 			} `json:"attributes"`
 			Relationships struct {
 				Workspace struct {
-					Data struct{ ID string `json:"id"` } `json:"data"`
+					Data struct {
+						ID string `json:"id"`
+					} `json:"data"`
 				} `json:"workspace"`
 				ConfigurationVersion struct {
-					Data struct{ ID string `json:"id"` } `json:"data"`
+					Data struct {
+						ID string `json:"id"`
+					} `json:"data"`
 				} `json:"configuration-version"`
 			} `json:"relationships"`
 		} `json:"data"`
@@ -838,9 +863,9 @@ func (h *RemoteTFEHandler) buildRunDoc(runID string, jobID int, tfeStatus, wsID,
 				"message":           "",
 				"status-timestamps": map[string]string{},
 				"actions": map[string]interface{}{
-					"is-confirmable":   tfeStatus == "planned" && !aa,
-					"is-discardable":   tfeStatus == "planned" || tfeStatus == "pending",
-					"is-cancelable":    tfeStatus == "planning" || tfeStatus == "applying",
+					"is-confirmable":      tfeStatus == "planned" && !aa,
+					"is-discardable":      tfeStatus == "planned" || tfeStatus == "pending",
+					"is-cancelable":       tfeStatus == "planning" || tfeStatus == "applying",
 					"is-force-cancelable": tfeStatus == "planning" || tfeStatus == "applying",
 				},
 				"permissions": map[string]bool{
@@ -950,8 +975,8 @@ func (h *RemoteTFEHandler) writePlanDoc(w http.ResponseWriter, ctx context.Conte
 			"id":   planID,
 			"type": "plans",
 			"attributes": map[string]interface{}{
-				"status":       planStatus,
-				"log-read-url": logReadURL,
+				"status":                planStatus,
+				"log-read-url":          logReadURL,
 				"resource-additions":    0,
 				"resource-changes":      0,
 				"resource-destructions": 0,
@@ -1408,7 +1433,7 @@ func (h *RemoteTFEHandler) handleOrganizations(w http.ResponseWriter, r *http.Re
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"data": tfeWorkspaceResource(wsID, parts[3], locked, terraformVersion, allowRemoteApply),
+			"data": tfeWorkspaceResource(wsID, parts[3], locked, terraformVersion, allowRemoteApply, h.tfeWorkingDirectory(r.Context(), wsID)),
 		})
 		return
 	}
@@ -1433,16 +1458,24 @@ func (h *RemoteTFEHandler) handleOrganizations(w http.ResponseWriter, r *http.Re
 			http.Error(w, "failed to list workspaces", http.StatusInternalServerError)
 			return
 		}
-		defer rows.Close()
-		data := []map[string]interface{}{}
+		type listedWS struct {
+			id, name           string
+			locked, autoRemote bool
+			tfVersion          *string
+		}
+		var listed []listedWS
 		for rows.Next() {
-			var wsID, name string
-			var locked, allowRemoteApply bool
-			var terraformVersion *string
-			if err := rows.Scan(&wsID, &name, &locked, &terraformVersion, &allowRemoteApply); err != nil {
+			var lw listedWS
+			if err := rows.Scan(&lw.id, &lw.name, &lw.locked, &lw.tfVersion, &lw.autoRemote); err != nil {
 				continue
 			}
-			data = append(data, tfeWorkspaceResource(wsID, name, locked, terraformVersion, allowRemoteApply))
+			listed = append(listed, lw)
+		}
+		rows.Close()
+		data := []map[string]interface{}{}
+		for _, lw := range listed {
+			data = append(data, tfeWorkspaceResource(lw.id, lw.name, lw.locked, lw.tfVersion, lw.autoRemote,
+				h.tfeWorkingDirectory(r.Context(), lw.id)))
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"data": data})
 		return

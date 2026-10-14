@@ -96,10 +96,32 @@ func (w *Workspace) setupFromTarGz() (string, error) {
 		return "", fmt.Errorf("failed to extract CLI config tar.gz: %w", err)
 	}
 
-	// For CLI uploads the Folder field is meaningless: Terraform CLI uploads only the
-	// specific directory's contents (not the full repo), so the extracted root IS the
-	// working directory. Applying Folder here would point to a non-existent sub-path.
-	return tempDir, nil
+	return resolveCLIWorkingDir(tempDir, w.Job.Folder), nil
+}
+
+// resolveCLIWorkingDir picks the directory terraform runs in for a CLI upload.
+//
+// When the workspace has a working directory, Terraform CLI uploads the repo
+// *root* (it strips that suffix from the local config dir — see the
+// "working-directory" attribute served by the TFE workspace endpoint) and the
+// run is expected to start in that subdirectory, so relative modules such as
+// ../../modules resolve. Java's TerraformExecutorServiceImpl does the same
+// (extracted root + folder). If the folder isn't in the archive — e.g. only the
+// subdirectory itself was uploaded — fall back to the extracted root.
+func resolveCLIWorkingDir(root, folder string) string {
+	folder = strings.TrimSpace(strings.SplitN(folder, ",", 2)[0])
+	if folder == "" || folder == "/" {
+		return root
+	}
+	candidate := filepath.Join(root, folder)
+	cleanRoot := filepath.Clean(root) + string(filepath.Separator)
+	if !strings.HasPrefix(filepath.Clean(candidate)+string(filepath.Separator), cleanRoot) {
+		return root // folder escapes the archive root
+	}
+	if info, err := os.Stat(candidate); err != nil || !info.IsDir() {
+		return root
+	}
+	return candidate
 }
 
 // extractTarGz extracts a gzipped tar archive into destDir.
