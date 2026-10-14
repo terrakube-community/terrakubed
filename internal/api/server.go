@@ -197,7 +197,15 @@ func NewServer(config Config) (*Server, error) {
 
 	// JSON:API Atomic Operations (https://jsonapi.org/ext/atomic/)
 	// POST /operations — used by the UI for workspace create/update.
+	// The UI's axios client is configured with REACT_APP_TERRAKUBE_API_URL as
+	// its base, which already includes "/api/v1" — so its POST to "/operations"
+	// actually lands on "/api/v1/operations", not bare "/operations". That
+	// fell under the "/api/v1/" prefix handler below, which tried to look up
+	// "operations" as a resource type and 404'd. Register both: the
+	// more-specific fixed path takes precedence over the "/api/v1/" prefix
+	// pattern in Go's ServeMux (same pattern as "/api/v1/federated" above).
 	mux.HandleFunc("/operations", jsonapiHandler.HandleOperations)
+	mux.HandleFunc("/api/v1/operations", jsonapiHandler.HandleOperations)
 
 	// JSON:API CRUD endpoints
 	mux.Handle("/api/v1/", jsonapiHandler)
