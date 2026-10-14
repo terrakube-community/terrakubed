@@ -171,7 +171,7 @@ func NewServer(config Config) (*Server, error) {
 
 	// State & TFE handlers
 	stateHandler := handler.NewTerraformStateHandler(db.Pool, config.Hostname, storageService)
-	tfeHandler := handler.NewRemoteTFEHandler(db.Pool, config.Hostname, storageService).WithLogReader(logStreamer)
+	tfeHandler := handler.NewRemoteTFEHandler(db.Pool, config.Hostname, storageService).WithLogReader(logStreamer).WithOwnerGroup(config.OwnerGroup)
 	wellKnownHandler := handler.NewWellKnownHandler(config.Hostname)
 
 	// Module and provider registry

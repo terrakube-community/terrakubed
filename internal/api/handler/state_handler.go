@@ -171,10 +171,11 @@ func (h *TerraformStateHandler) uploadHostedState(w http.ResponseWriter, r *http
 
 // RemoteTFEHandler handles TFE-compatible API endpoints.
 type RemoteTFEHandler struct {
-	pool      *pgxpool.Pool
-	hostname  string
-	storage   storage.StorageService
-	logReader logReader
+	pool       *pgxpool.Pool
+	hostname   string
+	storage    storage.StorageService
+	logReader  logReader
+	ownerGroup string
 }
 
 // logReader is a small interface so RemoteTFEHandler can use the streaming.LogStreamReader
@@ -189,6 +190,12 @@ func NewRemoteTFEHandler(pool *pgxpool.Pool, hostname string, storageSvc storage
 }
 
 // WithLogReader wires an optional log stream reader (Redis → storage fallback).
+// WithOwnerGroup sets the group allowed to bypass team permission checks.
+func (h *RemoteTFEHandler) WithOwnerGroup(group string) *RemoteTFEHandler {
+	h.ownerGroup = group
+	return h
+}
+
 func (h *RemoteTFEHandler) WithLogReader(lr logReader) *RemoteTFEHandler {
 	h.logReader = lr
 	return h
@@ -447,6 +454,20 @@ func (h *RemoteTFEHandler) handleWorkspaces(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	// State reads/writes the CLI performs for `state` commands.
+	if r.Method == http.MethodGet {
+		if wsID, ok := workspaceSubPath(parts, "current-state-version"); ok {
+			h.getCurrentStateVersion(w, r, wsID)
+			return
+		}
+	}
+	if r.Method == http.MethodPost {
+		if wsID, ok := workspaceSubPath(parts, "state-versions"); ok {
+			h.createWorkspaceStateVersion(w, r, wsID)
+			return
+		}
+	}
+
 	// POST /workspaces/{id}/actions/lock|unlock — taken by the CLI around any
 	// command that writes state (`state rm`, `import`, ...). Missing, so
 	// those failed with "Error acquiring the state lock: resource not found".
@@ -547,6 +568,14 @@ func (h *RemoteTFEHandler) handleStateVersions(w http.ResponseWriter, r *http.Re
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(doc)
 		return
+	}
+
+	// GET /state-versions/{historyId}
+	if r.Method == http.MethodGet {
+		if id := strings.TrimPrefix(path, "state-versions/"); id != "" && id != path && !strings.Contains(id, "/") {
+			h.getStateVersion(w, r, id)
+			return
+		}
 	}
 	http.Error(w, "Not found", http.StatusNotFound)
 }
