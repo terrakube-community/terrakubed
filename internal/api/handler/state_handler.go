@@ -234,6 +234,34 @@ func (h *RemoteTFEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// tfeWorkspaceResource builds the TFE "workspaces" resource object shared by
+// the by-name lookup, the search/list endpoints and the legacy search shortcut.
+func tfeWorkspaceResource(wsID, name string, locked bool, terraformVersion *string, allowRemoteApply bool) map[string]interface{} {
+	tfVer := ""
+	if terraformVersion != nil {
+		tfVer = *terraformVersion
+	}
+	return map[string]interface{}{
+		"id":   wsID,
+		"type": "workspaces",
+		"attributes": map[string]interface{}{
+			"name":              name,
+			"locked":            locked,
+			"terraform-version": tfVer,
+			// allow-remote-apply maps to TFC's auto-apply: when remote apply is
+			// allowed the CLI can trigger applies without a separate confirm step.
+			"auto-apply":     allowRemoteApply,
+			"execution-mode": "remote",
+			"permissions": map[string]bool{
+				"can-queue-run":  true,
+				"can-lock":       true,
+				"can-unlock":     true,
+				"can-read-state": true,
+			},
+		},
+	}
+}
+
 func (h *RemoteTFEHandler) handleWorkspaces(w http.ResponseWriter, r *http.Request, path string) {
 	// GET /remote/tfe/v2/workspaces?search[name]=xxx
 	// This is used by terraform CLI to find workspace by name
@@ -259,33 +287,9 @@ func (h *RemoteTFEHandler) handleWorkspaces(w http.ResponseWriter, r *http.Reque
 			return
 		}
 
-		tfVer := ""
-		if terraformVersion != nil {
-			tfVer = *terraformVersion
-		}
-
+		_ = orgID
 		doc := map[string]interface{}{
-			"data": []map[string]interface{}{
-				{
-					"id":   wsID,
-					"type": "workspaces",
-					"attributes": map[string]interface{}{
-						"name":               name,
-						"locked":             locked,
-						"terraform-version":  tfVer,
-						// allow-remote-apply maps to TFC's auto-apply: when remote apply is
-						// allowed the CLI can trigger applies without a separate confirm step.
-						"auto-apply":         allowRemoteApply,
-						"execution-mode":     "remote",
-						"permissions": map[string]bool{
-							"can-queue-run":  true,
-							"can-lock":       true,
-							"can-unlock":     true,
-							"can-read-state": true,
-						},
-					},
-				},
-			},
+			"data": []map[string]interface{}{tfeWorkspaceResource(wsID, name, locked, terraformVersion, allowRemoteApply)},
 		}
 		json.NewEncoder(w).Encode(doc)
 		return
@@ -1209,6 +1213,76 @@ func (h *RemoteTFEHandler) handleOrganizations(w http.ResponseWriter, r *http.Re
 			},
 		}
 		json.NewEncoder(w).Encode(doc)
+		return
+	}
+
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+
+	// GET /organizations/{org} — organization read
+	if len(parts) == 2 {
+		var orgID string
+		if err := h.pool.QueryRow(r.Context(),
+			`SELECT id FROM organization WHERE name = $1 LIMIT 1`, parts[1]).Scan(&orgID); err != nil {
+			http.Error(w, "Organization not found", http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": map[string]interface{}{
+				"id":         parts[1],
+				"type":       "organizations",
+				"attributes": map[string]interface{}{"name": parts[1]},
+			},
+		})
+		return
+	}
+
+	// GET /organizations/{org}/workspaces/{name} — the lookup `terraform init`
+	// performs first. Without it the CLI concludes the workspace doesn't exist
+	// and falls back to POST .../workspaces (create), which then 405s.
+	if len(parts) == 4 && parts[2] == "workspaces" {
+		var wsID string
+		var locked, allowRemoteApply bool
+		var terraformVersion *string
+		err := h.pool.QueryRow(r.Context(),
+			`SELECT w.id, w.locked, w.terraform_version, COALESCE(w.allow_remote_apply, false)
+			 FROM workspace w JOIN organization o ON w.organization_id = o.id
+			 WHERE o.name = $1 AND w.name = $2 AND w.deleted = false LIMIT 1`,
+			parts[1], parts[3],
+		).Scan(&wsID, &locked, &terraformVersion, &allowRemoteApply)
+		if err != nil {
+			http.Error(w, "Workspace not found", http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": tfeWorkspaceResource(wsID, parts[3], locked, terraformVersion, allowRemoteApply),
+		})
+		return
+	}
+
+	// GET /organizations/{org}/workspaces[?search[name]=x] — list/search
+	if len(parts) == 3 && parts[2] == "workspaces" {
+		search := r.URL.Query().Get("search[name]")
+		rows, err := h.pool.Query(r.Context(),
+			`SELECT w.id, w.name, w.locked, w.terraform_version, COALESCE(w.allow_remote_apply, false)
+			 FROM workspace w JOIN organization o ON w.organization_id = o.id
+			 WHERE o.name = $1 AND w.deleted = false AND ($2 = '' OR w.name ILIKE '%' || $2 || '%')
+			 ORDER BY w.name`, parts[1], search)
+		if err != nil {
+			http.Error(w, "failed to list workspaces", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		data := []map[string]interface{}{}
+		for rows.Next() {
+			var wsID, name string
+			var locked, allowRemoteApply bool
+			var terraformVersion *string
+			if err := rows.Scan(&wsID, &name, &locked, &terraformVersion, &allowRemoteApply); err != nil {
+				continue
+			}
+			data = append(data, tfeWorkspaceResource(wsID, name, locked, terraformVersion, allowRemoteApply))
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"data": data})
 		return
 	}
 
