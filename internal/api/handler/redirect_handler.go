@@ -33,6 +33,17 @@ func (h *AppRedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Path: /app/{orgId}/{wsId}/runs/{jobId}
 	path := strings.TrimPrefix(r.URL.Path, "/app/")
+
+	// `terraform login <host>` opens /app/settings/tokens?source=terraform-login
+	// and waits for the user to paste a token. Send them to the UI's token page.
+	// Only this exact path is redirected, and only to the configured UI host.
+	if path == "settings/tokens" {
+		if base := strings.TrimRight(h.uiURL, "/"); base != "" {
+			http.Redirect(w, r, base+"/settings/tokens", http.StatusFound)
+			return
+		}
+	}
+
 	parts := strings.Split(path, "/")
 	if len(parts) < 4 || parts[2] != "runs" {
 		http.Error(w, "invalid path — expected /app/{orgId}/{wsId}/runs/{jobId}", http.StatusBadRequest)
