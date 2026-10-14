@@ -294,6 +294,19 @@ func (h *RemoteTFEHandler) handleWorkspaces(w http.ResponseWriter, r *http.Reque
 		json.NewEncoder(w).Encode(doc)
 		return
 	}
+
+	// POST /workspaces/{id}/configuration-versions — the form the real
+	// Terraform CLI (go-tfe) and Java's RemoteTfeController use. Only the bare
+	// POST /configuration-versions existed here, so `terraform plan` on the
+	// remote backend died with "Failed to create configuration version:
+	// resource not found". Creation doesn't need the workspace id (the run
+	// links it later via relationships), so reuse the same handler.
+	if r.Method == http.MethodPost && len(parts) == 3 && parts[0] == "workspaces" && parts[1] != "" &&
+		parts[2] == "configuration-versions" {
+		h.handleConfigVersions(w, r, "configuration-versions")
+		return
+	}
+
 	http.Error(w, "Not found", http.StatusNotFound)
 }
 
