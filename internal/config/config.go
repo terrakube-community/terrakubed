@@ -14,9 +14,14 @@ import (
 
 type Config struct {
 	// Mixed Config
-	Port                      string
-	AzBuilderRegistry         string
-	AzBuilderApiUrl           string
+	Port              string
+	AzBuilderRegistry string
+	AzBuilderApiUrl   string
+	// AzBuilderInternalApiUrl is the in-cluster API address (the AzBuilderApiUrl env
+	// as configured, before TerrakubeApiUrl overrides AzBuilderApiUrl). Executor
+	// calls that carry payloads (context POST) use it to avoid the public
+	// CloudFront/WAF path, which rejected them with 403.
+	AzBuilderInternalApiUrl   string
 	RegistryStorageType       string
 	AwsBucketName             string
 	AwsRegion                 string
@@ -300,6 +305,7 @@ func LoadConfig() (*Config, error) {
 	}
 
 	// Override API / Secret if provided by executor envs
+	cfg.AzBuilderInternalApiUrl = os.Getenv("AzBuilderApiUrl")
 	if api := getEnvWithFallback("TERRAKUBE_API_URL", "TerrakubeApiUrl"); api != "" {
 		cfg.AzBuilderApiUrl = api
 	}
