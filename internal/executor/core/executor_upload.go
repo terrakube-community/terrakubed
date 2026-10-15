@@ -91,37 +91,6 @@ func buildChangesFromPlanJSON(planJSON string) ([]map[string]interface{}, error)
 	return result, nil
 }
 
-func (p *JobProcessor) getCurrentContext(jobId string) map[string]interface{} {
-	token, err := auth.GenerateTerrakubeToken(p.Config.InternalSecret)
-	if err != nil {
-		log.Printf("Failed to generate token for context GET: %v", err)
-		return map[string]interface{}{}
-	}
-
-	url := fmt.Sprintf("%s/context/v1/%s", p.Config.AzBuilderApiUrl, jobId)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return map[string]interface{}{}
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("Failed to GET context for job %s: %v", jobId, err)
-		return map[string]interface{}{}
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	var ctx map[string]interface{}
-	if err := json.Unmarshal(body, &ctx); err != nil || ctx == nil {
-		return map[string]interface{}{}
-	}
-	return ctx
-}
-
 func (p *JobProcessor) saveContext(jobId string, ctx map[string]interface{}) error {
 	token, err := auth.GenerateTerrakubeToken(p.Config.InternalSecret)
 	if err != nil {
@@ -171,21 +140,12 @@ func (p *JobProcessor) uploadPlanJSON(job *model.TerraformJob, workingDir string
 		return err
 	}
 
-	ctx := p.getCurrentContext(job.JobId)
-
-	planOutput, _ := ctx[contextPlanKey].(map[string]interface{})
-	if planOutput == nil {
-		planOutput = map[string]interface{}{}
+	// Send only this step's entries; the API merges them into the stored
+	// context (see ContextHandler.SaveContext).
+	ctx := map[string]interface{}{
+		contextPlanKey: map[string]interface{}{job.StepId: changes},
+		contextUIKey:   map[string]interface{}{job.StepId: structuredPlanMarker},
 	}
-	planOutput[job.StepId] = changes
-	ctx[contextPlanKey] = planOutput
-
-	uiOutput, _ := ctx[contextUIKey].(map[string]interface{})
-	if uiOutput == nil {
-		uiOutput = map[string]interface{}{}
-	}
-	uiOutput[job.StepId] = structuredPlanMarker
-	ctx[contextUIKey] = uiOutput
 
 	if err := p.saveContext(job.JobId, ctx); err != nil {
 		log.Printf("Failed to save plan context for job %s: %v", job.JobId, err)

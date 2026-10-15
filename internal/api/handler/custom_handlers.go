@@ -241,7 +241,37 @@ func (h *ContextHandler) SaveContext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	remotePath := fmt.Sprintf("tfplan/%s/context.json", jobId)
-	if err := h.storage.UploadFile(remotePath, bytes.NewReader(body)); err != nil {
+
+	// Merge into the stored context rather than replacing it. The executor
+	// posts only its own step's planStructuredOutput/terrakubeUI entries:
+	// round-tripping the whole document (which carries the VCS access token
+	// and SSH keys) was being rejected with 403 by the CloudFront/WAF layer in
+	// front of the API, and needlessly moved secrets over the wire again.
+	merged := map[string]interface{}{}
+	if reader, err := h.storage.DownloadFile(remotePath); err == nil {
+		existing, readErr := io.ReadAll(reader)
+		reader.Close()
+		if readErr == nil {
+			_ = json.Unmarshal(existing, &merged)
+		}
+	}
+	for k, v := range ctx {
+		incoming, inOK := v.(map[string]interface{})
+		current, curOK := merged[k].(map[string]interface{})
+		if inOK && curOK && (k == "planStructuredOutput" || k == "terrakubeUI") {
+			for sk, sv := range incoming {
+				current[sk] = sv
+			}
+			continue
+		}
+		merged[k] = v
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		http.Error(w, "failed to encode context", http.StatusInternalServerError)
+		return
+	}
+	if err := h.storage.UploadFile(remotePath, bytes.NewReader(out)); err != nil {
 		log.Printf("Failed to save plan context for job %s: %v", jobId, err)
 		http.Error(w, "failed to save context", http.StatusInternalServerError)
 		return
