@@ -102,7 +102,11 @@ func (p *JobProcessor) saveContext(jobId string, ctx map[string]interface{}) err
 		return fmt.Errorf("failed to marshal context: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/context/v1/%s", p.Config.AzBuilderApiUrl, jobId)
+	base := p.Config.AzBuilderInternalApiUrl
+	if base == "" {
+		base = p.Config.AzBuilderApiUrl
+	}
+	url := fmt.Sprintf("%s/context/v1/%s", base, jobId)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("failed to build context POST request: %w", err)
