@@ -384,7 +384,9 @@ func (p *JobProcessor) executeTerraform(ctx context.Context, job *model.Terrafor
 
 	// For plan jobs, parse and store structured plan JSON for UI
 	if isPlan {
-		p.uploadPlanJSON(job, workingDir, execPath)
+		if err := p.uploadPlanJSON(job, workingDir, execPath); err != nil {
+			fmt.Fprintf(streamer, "\n[Terrakube] Structured plan view unavailable: %v\n", err)
+		}
 	}
 
 	// Upload State and Output
