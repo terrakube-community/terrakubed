@@ -1391,6 +1391,20 @@ func (h *RemoteTFEHandler) handleAccountDetails(w http.ResponseWriter, r *http.R
 
 // handleOrganizations serves /remote/tfe/v2/organizations/* stubs.
 // Terraform CLI hits the entitlement-set endpoint to check feature flags.
+// tfeCapacityDoc builds the TFE "organization-capacity" document.
+func tfeCapacityDoc(orgName string, pending, running int) map[string]interface{} {
+	return map[string]interface{}{
+		"data": map[string]interface{}{
+			"id":   orgName,
+			"type": "organization-capacity",
+			"attributes": map[string]interface{}{
+				"pending": pending,
+				"running": running,
+			},
+		},
+	}
+}
+
 func (h *RemoteTFEHandler) handleOrganizations(w http.ResponseWriter, r *http.Request, path string) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1464,6 +1478,24 @@ func (h *RemoteTFEHandler) handleOrganizations(w http.ResponseWriter, r *http.Re
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"data": tfeWorkspaceResource(wsID, parts[3], locked, terraformVersion, allowRemoteApply, h.tfeWorkingDirectory(r.Context(), wsID)),
 		})
+		return
+	}
+
+	// GET /organizations/{org}/capacity — queried by `terraform plan` right after
+	// the run is created ("Failed to retrieve capacity: resource not found").
+	// Java returns pending=0 and running=<configured executor replicas>; with
+	// ephemeral per-job executors there is no fixed pool, so report the runs
+	// actually executing in the organization instead.
+	if len(parts) == 3 && parts[2] == "capacity" {
+		var running int
+		err := h.pool.QueryRow(r.Context(),
+			`SELECT COUNT(*) FROM job j JOIN organization o ON j.organization_id = o.id
+			 WHERE o.name = $1 AND j.status = 'running'`, parts[1]).Scan(&running)
+		if err != nil {
+			http.Error(w, "Organization not found", http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(tfeCapacityDoc(parts[1], 0, running))
 		return
 	}
 

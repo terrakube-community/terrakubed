@@ -92,3 +92,12 @@ func TestCanManageStateWithoutDatabase(t *testing.T) {
 		}
 	}
 }
+
+func TestTFECapacityDoc(t *testing.T) {
+	doc := tfeCapacityDoc("antero", 0, 3)
+	data := doc["data"].(map[string]interface{})
+	attrs := data["attributes"].(map[string]interface{})
+	if data["type"] != "organization-capacity" || data["id"] != "antero" || attrs["pending"] != 0 || attrs["running"] != 3 {
+		t.Fatalf("unexpected capacity doc: %+v", doc)
+	}
+}
