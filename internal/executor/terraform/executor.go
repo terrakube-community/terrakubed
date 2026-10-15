@@ -1,12 +1,14 @@
 package terraform
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/hashicorp/terraform-exec/tfexec"
 	"github.com/terrakube-community/terrakubed/internal/executor/logs"
@@ -256,9 +258,17 @@ func (e *Executor) ShowPlanRawJSON() (string, error) {
 		envSlice = append(envSlice, k+"="+v)
 	}
 	cmd.Env = envSlice
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("terraform show -json failed: %w", err)
+		// Include terraform's own message: the ephemeral pod (and its log) is
+		// gone by the time anyone asks why the structured plan view is missing.
+		msg := strings.TrimSpace(stderr.String())
+		if len(msg) > 1000 {
+			msg = msg[:1000] + "..."
+		}
+		return "", fmt.Errorf("terraform show -json failed: %w: %s", err, msg)
 	}
 	return string(output), nil
 }

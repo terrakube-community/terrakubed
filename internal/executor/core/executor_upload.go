@@ -155,18 +155,20 @@ func (p *JobProcessor) saveContext(jobId string, ctx map[string]interface{}) err
 	return nil
 }
 
-func (p *JobProcessor) uploadPlanJSON(job *model.TerraformJob, workingDir string, execPath string) {
+// uploadPlanJSON publishes the structured plan for the UI. The error is
+// informational only: a missing structured view never fails the job.
+func (p *JobProcessor) uploadPlanJSON(job *model.TerraformJob, workingDir string, execPath string) error {
 	tfExecutor := terraform.NewExecutor(job, workingDir, nil, execPath)
 	planJSON, err := tfExecutor.ShowPlanRawJSON()
 	if err != nil {
 		log.Printf("Failed to get plan JSON (skipping context upload): %v", err)
-		return
+		return err
 	}
 
 	changes, err := buildChangesFromPlanJSON(planJSON)
 	if err != nil {
 		log.Printf("Failed to build changes from plan JSON: %v", err)
-		return
+		return err
 	}
 
 	ctx := p.getCurrentContext(job.JobId)
@@ -187,9 +189,10 @@ func (p *JobProcessor) uploadPlanJSON(job *model.TerraformJob, workingDir string
 
 	if err := p.saveContext(job.JobId, ctx); err != nil {
 		log.Printf("Failed to save plan context for job %s: %v", job.JobId, err)
-		return
+		return err
 	}
 	log.Printf("Saved structured plan context for job %s step %s (%d changes)", job.JobId, job.StepId, len(changes))
+	return nil
 }
 
 func (p *JobProcessor) uploadStateAndOutput(job *model.TerraformJob, workingDir string) {
