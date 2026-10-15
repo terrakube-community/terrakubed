@@ -995,6 +995,8 @@ func (h *RemoteTFEHandler) writePlanDoc(w http.ResponseWriter, ctx context.Conte
 		planStatus = "finished"
 	case "failed":
 		planStatus = "errored"
+	case "cancelled":
+		planStatus = "canceled"
 	}
 
 	logReadURL := fmt.Sprintf("https://%s/remote/tfe/v2/plans/%s/log", h.hostname, planID)
@@ -1037,9 +1039,7 @@ func (h *RemoteTFEHandler) getPlanLog(w http.ResponseWriter, r *http.Request, jo
 	// Try Redis stream first (live log from running executor)
 	if h.logReader != nil {
 		if data, err := h.logReader.GetStepOutput(r.Context(), orgID, fmt.Sprintf("%d", jobID), stepID); err == nil && len(data) > 0 {
-			w.Header().Set("Content-Type", "text/plain")
-			w.WriteHeader(http.StatusOK)
-			w.Write(data)
+			serveLogSlice(w, r, data)
 			return
 		}
 	}
@@ -1049,9 +1049,8 @@ func (h *RemoteTFEHandler) getPlanLog(w http.ResponseWriter, r *http.Request, jo
 	reader, err := h.storage.DownloadFile(storagePath)
 	if err == nil {
 		defer reader.Close()
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusOK)
-		io.Copy(w, reader)
+		data, _ := io.ReadAll(reader)
+		serveLogSlice(w, r, data)
 		return
 	}
 
@@ -1178,6 +1177,8 @@ func (h *RemoteTFEHandler) writeApplyDoc(w http.ResponseWriter, ctx context.Cont
 		applyStatus = "finished"
 	case "failed":
 		applyStatus = "errored"
+	case "cancelled":
+		applyStatus = "canceled"
 	case "":
 		// No apply step yet — derive from job status
 		switch jobStatus {
@@ -1232,9 +1233,7 @@ func (h *RemoteTFEHandler) getApplyLog(w http.ResponseWriter, r *http.Request, j
 	// Try Redis stream first (live log from running executor)
 	if h.logReader != nil {
 		if data, err := h.logReader.GetStepOutput(r.Context(), orgID, fmt.Sprintf("%d", jobID), stepID); err == nil && len(data) > 0 {
-			w.Header().Set("Content-Type", "text/plain")
-			w.WriteHeader(http.StatusOK)
-			w.Write(data)
+			serveLogSlice(w, r, data)
 			return
 		}
 	}
@@ -1254,9 +1253,8 @@ func (h *RemoteTFEHandler) getApplyLog(w http.ResponseWriter, r *http.Request, j
 	}
 	defer reader.Close()
 
-	w.Header().Set("Content-Type", "text/plain")
-	w.WriteHeader(http.StatusOK)
-	io.Copy(w, reader)
+	data, _ := io.ReadAll(reader)
+	serveLogSlice(w, r, data)
 }
 
 // parseApplyID extracts the numeric job ID from "apply-{jobId}" or plain "{jobId}".
