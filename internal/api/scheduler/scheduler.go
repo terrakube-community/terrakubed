@@ -322,15 +322,22 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 				continue
 			}
 
-			_, _ = s.pool.Exec(ctx,
-				"UPDATE workspace SET locked = false WHERE id = (SELECT workspace_id FROM job WHERE id = $1)", jobID)
-			if _, err := s.pool.Exec(ctx,
-				"UPDATE job SET status = 'queue' WHERE id = $1", jobID); err != nil {
+			// Claim the transition first: with several API replicas polling, only the
+			// one whose UPDATE matches the row may unlock the workspace. Unlocking
+			// from a stale read would release a lock a dispatched step already holds.
+			tag, err := s.pool.Exec(ctx,
+				"UPDATE job SET status = 'queue' WHERE id = $1 AND status = 'pending'", jobID)
+			if err != nil {
 				log.Printf("Job %d: failed to queue: %v", jobID, err)
-			} else {
-				log.Printf("Job %d queued (workspace unlocked for next step)", jobID)
-				s.touchWorkspaceLastJobStatus(ctx, jobID, "queue")
+				continue
 			}
+			if tag.RowsAffected() == 0 {
+				continue
+			}
+			_, _ = s.pool.Exec(ctx,
+				"UPDATE workspace SET locked = false WHERE id = $1", workspaceID)
+			log.Printf("Job %d queued (workspace unlocked for next step)", jobID)
+			s.touchWorkspaceLastJobStatus(ctx, jobID, "queue")
 			continue
 		}
 
@@ -356,18 +363,23 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 				continue
 			}
 
+			// Claim the transition first (see pending → queue above).
+			tag, err := s.pool.Exec(ctx,
+				"UPDATE job SET status = 'queue' WHERE id = $1 AND status = 'approved'", jobID)
+			if err != nil {
+				log.Printf("Job %d: failed to queue after approval: %v", jobID, err)
+				continue
+			}
+			if tag.RowsAffected() == 0 {
+				continue
+			}
 			_, _ = s.pool.Exec(ctx,
 				`UPDATE step SET status = 'completed'
 				 WHERE job_id = $1 AND status = 'waitingApproval'`, jobID)
 			_, _ = s.pool.Exec(ctx,
 				"UPDATE workspace SET locked = false WHERE id = $1", workspaceID)
-			if _, err := s.pool.Exec(ctx,
-				"UPDATE job SET status = 'queue' WHERE id = $1", jobID); err != nil {
-				log.Printf("Job %d: failed to queue after approval: %v", jobID, err)
-			} else {
-				log.Printf("Job %d approved — approval step completed, queued for apply/destroy", jobID)
-				s.touchWorkspaceLastJobStatus(ctx, jobID, "queue")
-			}
+			log.Printf("Job %d approved — approval step completed, queued for apply/destroy", jobID)
+			s.touchWorkspaceLastJobStatus(ctx, jobID, "queue")
 			continue
 		}
 
@@ -425,6 +437,24 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 
 		// ── terraform / custom step → K8s executor ───────────────────────────
 
+		// Atomically claim the step and the workspace lock. The poll query and the
+		// pending-step lookup above are plain reads, so with more than one API
+		// replica (each runs this loop) two schedulers can reach this point for the
+		// same job. Only the replica whose conditional UPDATEs match proceeds.
+		if tag, err := s.pool.Exec(ctx,
+			"UPDATE step SET status = 'running' WHERE id = $1 AND status = 'pending'", stepID); err != nil || tag.RowsAffected() == 0 {
+			continue
+		}
+		if tag, err := s.pool.Exec(ctx,
+			`UPDATE workspace SET locked = true, last_job_status = 'running', last_job_date = NOW()
+			 WHERE id = $1 AND locked IS NOT TRUE`, workspaceID); err != nil || tag.RowsAffected() == 0 {
+			// Workspace is held by someone else (another replica or a TFE CLI lock):
+			// hand the step back so a later poll retries it.
+			_, _ = s.pool.Exec(ctx,
+				"UPDATE step SET status = 'pending' WHERE id = $1 AND status = 'running'", stepID)
+			continue
+		}
+
 		// Ensure the VCS access token is fresh (GitLab/Bitbucket tokens expire after 2h).
 		// GetFreshToken returns the stored token without a round-trip when it is still valid.
 		freshToken := accessToken
@@ -468,12 +498,7 @@ func (s *JobScheduler) pollJobs(ctx context.Context) {
 		s.writeContextJSON(ctx, execCtx)
 
 		_, _ = s.pool.Exec(ctx,
-			"UPDATE step SET status = 'running' WHERE id = $1", stepID)
-		_, _ = s.pool.Exec(ctx,
 			"UPDATE job SET status = 'running' WHERE id = $1", jobID)
-		// Lock the workspace for the duration of the run to prevent concurrent executions
-		_, _ = s.pool.Exec(ctx,
-			"UPDATE workspace SET locked = true, last_job_status = 'running', last_job_date = NOW() WHERE id = $1", workspaceID)
 		// Post "pending" commit status at the start of a run
 		go s.postCommitStatusForStep(ctx, jobID, stepType)
 
