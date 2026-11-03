@@ -8,6 +8,8 @@ export type ApplyResource = {
   action: "create" | "update" | "delete" | "replace" | "read";
   state: ApplyResourceState;
   detail?: string;
+  /** This resource's own console lines (progress and, on failure, the error block). */
+  log: string[];
 };
 
 export type ApplyProgress = {
@@ -64,7 +66,7 @@ export const parseApplyProgress = (log?: string, planned: PlannedResource[] = []
   const halves = new Map<string, number>();
   // Seed from the plan so not-yet-started resources show as pending, in plan order.
   for (const p of planned) {
-    resources.set(p.address, { address: p.address, action: p.action, state: "pending" });
+    resources.set(p.address, { address: p.address, action: p.action, state: "pending", log: [] });
   }
   if (!log) {
     return { resources: Array.from(resources.values()), errors };
@@ -72,9 +74,43 @@ export const parseApplyProgress = (log?: string, planned: PlannedResource[] = []
 
   const lines = stripAnsi(log).split(/\r?\n/);
   let pendingError: string | undefined;
+  // Lines of the Error block being read (they are boxed with │ and end at ╵).
+  let errorBlock: string[] | undefined;
+
+  const closeErrorBlock = () => {
+    if (!errorBlock) {
+      return;
+    }
+    const withLine = errorBlock.map((l) => ERROR_WITH.exec(l)).find((m) => m !== null);
+    if (withLine && pendingError !== undefined) {
+      const address = withLine[1];
+      const current = resources.get(address) ?? {
+        address,
+        action: "create" as const,
+        state: "running" as const,
+        log: [],
+      };
+      resources.set(address, {
+        ...current,
+        state: "error",
+        detail: pendingError,
+        log: [...current.log, ...errorBlock],
+      });
+    }
+    errorBlock = undefined;
+    pendingError = undefined;
+  };
 
   for (const raw of lines) {
     const line = raw.trim();
+
+    if (errorBlock) {
+      if (line.startsWith("│")) {
+        errorBlock.push(line.replace(/^│\s?/, ""));
+        continue;
+      }
+      closeErrorBlock();
+    }
 
     const started = STARTED.exec(line);
     if (started) {
@@ -89,7 +125,7 @@ export const parseApplyProgress = (log?: string, planned: PlannedResource[] = []
         previous?.action === "replace" || (previous && previous.state !== "pending" && previous.action !== action)
           ? "replace"
           : action;
-      resources.set(address, { address, action: merged, state: "running" });
+      resources.set(address, { address, action: merged, state: "running", log: [...(previous?.log ?? []), line] });
       continue;
     }
 
@@ -98,6 +134,7 @@ export const parseApplyProgress = (log?: string, planned: PlannedResource[] = []
       const current = resources.get(still[1]);
       if (current) {
         current.detail = `${still[3]} elapsed`;
+        current.log.push(line);
       }
       continue;
     }
@@ -108,7 +145,12 @@ export const parseApplyProgress = (log?: string, planned: PlannedResource[] = []
       if (isDataSource(address)) {
         continue;
       }
-      const current = resources.get(address) ?? { address, action: ACTION_BY_VERB[verb], state: "running" as const };
+      const current = resources.get(address) ?? {
+        address,
+        action: ACTION_BY_VERB[verb],
+        state: "running" as const,
+        log: [],
+      };
       // The first half of a replace finishes (Destruction) while the resource is still being recreated.
       // A replace is two operations (destroy + create, in either order): only the second completion finishes it.
       const completions = (halves.get(address) ?? 0) + 1;
@@ -118,6 +160,7 @@ export const parseApplyProgress = (log?: string, planned: PlannedResource[] = []
         ...current,
         state: midReplace ? "running" : "done",
         detail: midReplace ? current.detail : `after ${duration}`,
+        log: [...current.log, line],
       });
       continue;
     }
@@ -126,17 +169,10 @@ export const parseApplyProgress = (log?: string, planned: PlannedResource[] = []
     if (errStart) {
       pendingError = errStart[1].trim();
       errors.push(pendingError);
-      continue;
-    }
-
-    const errWith = ERROR_WITH.exec(line);
-    if (errWith && pendingError !== undefined) {
-      const address = errWith[1];
-      const current = resources.get(address) ?? { address, action: "create" as const, state: "running" as const };
-      resources.set(address, { ...current, state: "error", detail: pendingError });
-      pendingError = undefined;
+      errorBlock = [`Error: ${pendingError}`];
     }
   }
+  closeErrorBlock();
 
   return { resources: Array.from(resources.values()), errors };
 };

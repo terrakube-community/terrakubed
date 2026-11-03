@@ -76,7 +76,7 @@ type SummarySegment = {
   symbol: string;
 };
 
-const actionMeta: Record<
+export const actionMeta: Record<
   ActionName,
   {
     displayLabel: string;
@@ -129,7 +129,7 @@ const actionMeta: Record<
   },
 };
 
-const providerIconMap = {
+export const providerIconMap = {
   aws: FaAws,
   google: FaGoogle,
   "google-beta": FaGoogle,
@@ -744,7 +744,7 @@ const getResourceAddress = (change: PlanChange) => {
   return "resource";
 };
 
-const getProviderName = (change: PlanChange) => {
+export const getProviderName = (change: PlanChange) => {
   if (change.resourceType) {
     const segments = change.resourceType.split("_");
     if (segments[0] && segments[0].trim().length > 0) {
@@ -770,7 +770,7 @@ const getProviderName = (change: PlanChange) => {
   return "terraform";
 };
 
-const getProviderLabel = (providerName: string) => {
+export const getProviderLabel = (providerName: string) => {
   const normalizedProviderName = providerName.replace(/[^a-z0-9]+/gi, " ").trim();
   const parts = normalizedProviderName.split(" ").filter((part) => part.length > 0);
 

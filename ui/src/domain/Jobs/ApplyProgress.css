@@ -1,118 +1,98 @@
-.apply-progress {
-  background: #ffffff;
-  border: 1px solid #d8dde6;
-  border-radius: 8px;
-  overflow: hidden;
+/* Layout, summary strip, toolbar and rows come from StructuredPlanOutput.css so apply matches plan. */
+
+.apply-progress-segment--done {
+  background: #198754;
 }
 
-.apply-progress-summary {
-  border-bottom: 1px solid #e7ebf0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 12px;
-}
-
-.apply-progress-chip {
-  border-radius: 12px;
-  color: #ffffff;
-  font-size: 12px;
-  padding: 2px 10px;
-}
-
-.apply-progress-done {
-  background: #2eb039;
-}
-
-.apply-progress-running {
+.apply-progress-segment--running {
   background: #d9a400;
 }
 
-.apply-progress-error {
-  background: #e5303d;
+.apply-progress-segment--error {
+  background: #cf3d38;
 }
 
-.apply-progress-idle {
+.apply-progress-segment--pending {
   background: #8a93a3;
 }
 
-.apply-progress-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-.apply-progress-row {
+.apply-progress-status {
   align-items: center;
-  border-bottom: 1px solid #f0f2f5;
-  border-left: 4px solid transparent;
-  display: flex;
-  gap: 10px;
-  padding: 8px 12px;
-}
-
-.apply-progress-row-done {
-  border-left-color: #2eb039;
-}
-
-.apply-progress-row-done .apply-progress-icon {
-  color: #2eb039;
-}
-
-.apply-progress-row-running {
-  background: #fffbe6;
-  border-left-color: #d9a400;
-}
-
-.apply-progress-row-running .apply-progress-icon {
-  color: #d9a400;
-}
-
-.apply-progress-row-error {
-  background: #fff1f0;
-  border-left-color: #e5303d;
-}
-
-.apply-progress-row-error .apply-progress-icon {
-  color: #e5303d;
-}
-
-.apply-progress-address {
-  flex: 1;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 13px;
-  overflow-wrap: anywhere;
-}
-
-.apply-progress-action {
-  color: #5b6472;
+  border-radius: 12px;
+  display: inline-flex;
+  flex-shrink: 0;
   font-size: 12px;
+  font-weight: 600;
+  gap: 6px;
+  padding: 2px 10px;
 }
 
-.apply-progress-detail {
+.apply-progress-statusDetail {
+  font-weight: 400;
+  opacity: 0.85;
+}
+
+.apply-progress-status--done {
+  background: #e8f6ee;
+  color: #147d37;
+}
+
+.apply-progress-status--running {
+  background: #fff6d6;
+  color: #8a6500;
+}
+
+.apply-progress-status--error {
+  background: #fde7e6;
+  color: #b42318;
+}
+
+.apply-progress-status--pending {
+  background: #f1f3f6;
   color: #5b6472;
-  font-size: 12px;
-  max-width: 40%;
-  text-align: right;
 }
 
-.apply-progress-errors {
-  background: #fff1f0;
-  border-top: 1px solid #ffccc7;
-  color: #a8071a;
+.apply-progress-row--running {
+  background: #fffdf3;
+}
+
+.apply-progress-row--error {
+  background: #fff8f7;
+}
+
+.apply-progress-log {
+  background: #0f172a;
+  border-radius: 6px;
+  color: #e2e8f0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
+  margin: 0;
+  overflow-x: auto;
   padding: 10px 12px;
+  white-space: pre-wrap;
 }
 
-.apply-progress-row-pending {
-  border-left-color: #c5cbd6;
+[data-theme="dark"] .apply-progress-status--done {
+  background: rgba(46, 160, 67, 0.15);
+  color: #3fb950;
 }
 
-.apply-progress-row-pending .apply-progress-icon {
-  color: #8a93a3;
+[data-theme="dark"] .apply-progress-status--running {
+  background: rgba(217, 164, 0, 0.15);
+  color: #e3b341;
 }
 
-.apply-progress-row-pending .apply-progress-address {
-  color: #5b6472;
+[data-theme="dark"] .apply-progress-status--error {
+  background: rgba(248, 81, 73, 0.15);
+  color: #ff7b72;
+}
+
+[data-theme="dark"] .apply-progress-status--pending {
+  background: var(--tk-fill-primary);
+  color: inherit;
+}
+
+[data-theme="dark"] .apply-progress-row--running,
+[data-theme="dark"] .apply-progress-row--error {
+  background: transparent;
 }
