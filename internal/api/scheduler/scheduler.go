@@ -731,11 +731,52 @@ func (s *JobScheduler) writeContextJSON(ctx context.Context, execCtx *ExecutionC
 		return
 	}
 	path := fmt.Sprintf("tfplan/%d/context.json", execCtx.JobID)
+
+	// This runs at every step dispatch. Overwriting the file wholesale wiped the
+	// plan step's planStructuredOutput/terrakubeUI as soon as the apply step was
+	// dispatched, so the UI fell back to the raw console log. Carry those keys over.
+	if merged, ok := s.preserveStructuredPlan(path, data); ok {
+		data = merged
+	}
 	if err := s.storage.UploadFile(path, bytes.NewReader(data)); err != nil {
 		log.Printf("Job %d: failed to write context.json to storage: %v", execCtx.JobID, err)
 	} else {
 		log.Printf("Job %d: wrote context.json to %s", execCtx.JobID, path)
 	}
+}
+
+// preserveStructuredPlan copies planStructuredOutput and terrakubeUI from the
+// context.json already in storage (written by earlier steps' executors) into the
+// freshly marshalled one.
+func (s *JobScheduler) preserveStructuredPlan(path string, fresh []byte) ([]byte, bool) {
+	rc, err := s.storage.DownloadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	defer rc.Close()
+	var existing map[string]json.RawMessage
+	if err := json.NewDecoder(rc).Decode(&existing); err != nil {
+		return nil, false
+	}
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal(fresh, &out); err != nil {
+		return nil, false
+	}
+	carried := false
+	for _, k := range []string{"planStructuredOutput", "terrakubeUI"} {
+		if v, ok := existing[k]; ok {
+			out[k] = v
+			carried = true
+		}
+	}
+	if !carried {
+		return nil, false
+	}
+	merged, err := json.Marshal(out)
+	if err != nil {
+		return nil, false
+	}
+	return merged, true
 }
 
 // MarshalJSON serializes ExecutionContext to JSON for passing to ephemeral pods.
