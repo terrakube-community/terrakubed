@@ -33,7 +33,8 @@ describe("parseApplyProgress", () => {
         "x.y: Creation complete after 3s [id=2]",
       ].join("\n")
     );
-    expect(resources).toEqual([{ address: "x.y", action: "replace", state: "done", detail: "after 3s" }]);
+    expect(resources).toHaveLength(1);
+    expect(resources[0]).toMatchObject({ address: "x.y", action: "replace", state: "done", detail: "after 3s" });
   });
 
   it("returns nothing for empty or plan-only logs", () => {
@@ -82,5 +83,22 @@ describe("parseApplyProgress", () => {
       planned
     );
     expect(full.resources[0]).toMatchObject({ action: "replace", state: "done" });
+  });
+
+  it("attaches each resource's own lines and the full error block", () => {
+    const { resources } = parseApplyProgress(
+      [
+        "aws_instance.b: Creating...",
+        "╷",
+        "│ Error: creating EC2 Instance: InvalidParameter",
+        "│ ",
+        "│   with aws_instance.b,",
+        '│   on main.tf line 4, in resource "aws_instance" "b":',
+        "╵",
+      ].join("\n")
+    );
+    expect(resources[0].state).toBe("error");
+    expect(resources[0].log[0]).toBe("aws_instance.b: Creating...");
+    expect(resources[0].log.join("\n")).toContain("on main.tf line 4");
   });
 });
