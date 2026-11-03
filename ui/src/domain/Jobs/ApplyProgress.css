@@ -104,3 +104,15 @@
   font-size: 12px;
   padding: 10px 12px;
 }
+
+.apply-progress-row-pending {
+  border-left-color: #c5cbd6;
+}
+
+.apply-progress-row-pending .apply-progress-icon {
+  color: #8a93a3;
+}
+
+.apply-progress-row-pending .apply-progress-address {
+  color: #5b6472;
+}

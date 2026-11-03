@@ -36,7 +36,7 @@ import { TerminalOutput } from "./TerminalOutput";
 import { getJobOutputRequestUrl, getPublicApiOrigin, isTerrakubeApiUrl } from "./outputUrl";
 import { shouldStepBeCollapsible, shouldStepBeExpandedByDefault } from "./stepExpansion";
 import { ApplyProgress } from "./ApplyProgress";
-import { hasApplyProgress } from "./applyProgressParser";
+import { hasApplyProgress, plannedFromChanges } from "./applyProgressParser";
 import { StructuredPlanOutput } from "./StructuredPlanOutput";
 import { StructuredPlanOutputByStep, normalizeStructuredPlanOutput, normalizeUITemplates } from "./structuredPlan";
 
@@ -195,7 +195,15 @@ export const DetailsJob = ({ jobId }: Props) => {
     if (!hasStructuredView) {
       // Apply/destroy steps have no plan data of their own: show per-resource progress
       // parsed from the live log, with the console one toggle away.
-      if (hasApplyProgress(item.outputLog)) {
+      // The nearest earlier step with structured plan data tells us what this apply will touch.
+      const planStep = [...(steps ?? [])]
+        .filter((s) => s.stepNumber < item.stepNumber)
+        .sort((a, b) => b.stepNumber - a.stepNumber)
+        .find((s) => planStructuredOutput[s.id] || planStructuredOutput[String(s.stepNumber)]);
+      const planned = plannedFromChanges(
+        planStep ? planStructuredOutput[planStep.id] || planStructuredOutput[String(planStep.stepNumber)] : undefined
+      );
+      if (hasApplyProgress(item.outputLog, planned)) {
         return (
           <>
             <div style={{ textAlign: "right", padding: "5px" }}>
@@ -205,7 +213,7 @@ export const DetailsJob = ({ jobId }: Props) => {
               </Radio.Group>
             </div>
             {uiType === "structured" ? (
-              <ApplyProgress outputLog={item.outputLog} isRunning={item.status === "running"} />
+              <ApplyProgress outputLog={item.outputLog} isRunning={item.status === "running"} planned={planned} />
             ) : (
               renderConsoleOutput(item)
             )}
