@@ -1,11 +1,12 @@
-import { CheckCircleFilled, CloseCircleFilled, LoadingOutlined, MinusCircleOutlined } from "@ant-design/icons";
+import { CheckCircleFilled, ClockCircleOutlined, CloseCircleFilled, LoadingOutlined } from "@ant-design/icons";
 import { useMemo } from "react";
-import { ApplyResource, parseApplyProgress } from "./applyProgressParser";
+import { ApplyResource, PlannedResource, parseApplyProgress } from "./applyProgressParser";
 import "./ApplyProgress.css";
 
 type Props = {
   outputLog?: string;
   isRunning: boolean;
+  planned?: PlannedResource[];
 };
 
 const ACTION_LABEL: Record<ApplyResource["action"], string> = {
@@ -17,13 +18,14 @@ const ACTION_LABEL: Record<ApplyResource["action"], string> = {
 };
 
 const STATE_ICON = {
+  pending: <ClockCircleOutlined />,
   running: <LoadingOutlined spin />,
   done: <CheckCircleFilled />,
   error: <CloseCircleFilled />,
 };
 
-export const ApplyProgress = ({ outputLog, isRunning }: Props) => {
-  const { resources, errors } = useMemo(() => parseApplyProgress(outputLog), [outputLog]);
+export const ApplyProgress = ({ outputLog, isRunning, planned }: Props) => {
+  const { resources, errors } = useMemo(() => parseApplyProgress(outputLog, planned), [outputLog, planned]);
 
   const counts = useMemo(() => {
     return resources.reduce(
@@ -31,7 +33,7 @@ export const ApplyProgress = ({ outputLog, isRunning }: Props) => {
         acc[r.state] += 1;
         return acc;
       },
-      { running: 0, done: 0, error: 0 }
+      { pending: 0, running: 0, done: 0, error: 0 }
     );
   }, [resources]);
 
@@ -41,10 +43,8 @@ export const ApplyProgress = ({ outputLog, isRunning }: Props) => {
         <span className="apply-progress-chip apply-progress-done">{counts.done} complete</span>
         <span className="apply-progress-chip apply-progress-running">{counts.running} in progress</span>
         <span className="apply-progress-chip apply-progress-error">{counts.error} failed</span>
-        {!isRunning && counts.running > 0 && (
-          <span className="apply-progress-chip apply-progress-idle">
-            <MinusCircleOutlined /> {counts.running} did not finish
-          </span>
+        {counts.pending > 0 && (
+          <span className="apply-progress-chip apply-progress-idle">{counts.pending} pending</span>
         )}
       </div>
       <ul className="apply-progress-list">

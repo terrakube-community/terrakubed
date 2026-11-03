@@ -1,4 +1,4 @@
-import { parseApplyProgress } from "../applyProgressParser";
+import { parseApplyProgress, plannedFromChanges } from "../applyProgressParser";
 
 describe("parseApplyProgress", () => {
   it("tracks running, done and error resources", () => {
@@ -39,5 +39,48 @@ describe("parseApplyProgress", () => {
   it("returns nothing for empty or plan-only logs", () => {
     expect(parseApplyProgress(undefined).resources).toEqual([]);
     expect(parseApplyProgress("Refreshing state... [id=a]").resources).toEqual([]);
+  });
+
+  it("lists planned resources as pending and updates them as the log advances", () => {
+    const planned = plannedFromChanges([
+      { address: "a.one", actions: ["create"] },
+      { address: "a.two", actions: ["update"] },
+      { address: "a.three", actions: ["delete", "create"] },
+      { address: "data.x.y", actions: ["read"] },
+    ]);
+    expect(planned.map((p) => p.address)).toEqual(["a.one", "a.two", "a.three"]);
+
+    const log = ["a.one: Creating...", "a.one: Creation complete after 1s [id=1]", "a.two: Modifying..."].join("\n");
+    const { resources } = parseApplyProgress(log, planned);
+    expect(resources.map((r) => [r.address, r.state])).toEqual([
+      ["a.one", "done"],
+      ["a.two", "running"],
+      ["a.three", "pending"],
+    ]);
+  });
+
+  it("ignores data source reads", () => {
+    const { resources } = parseApplyProgress(
+      ["data.aws_caller_identity.current: Reading...", "data.aws_caller_identity.current: Read complete after 0s"].join(
+        "\n"
+      )
+    );
+    expect(resources).toEqual([]);
+  });
+
+  it("keeps a planned replace running until both halves complete", () => {
+    const planned = plannedFromChanges([{ address: "r.x", actions: ["delete", "create"] }]);
+    const half = parseApplyProgress(["r.x: Destroying...", "r.x: Destruction complete after 1s"].join("\n"), planned);
+    expect(half.resources[0]).toMatchObject({ action: "replace", state: "running" });
+    const full = parseApplyProgress(
+      [
+        "r.x: Destroying...",
+        "r.x: Destruction complete after 1s",
+        "r.x: Creating...",
+        "r.x: Creation complete after 2s",
+      ].join("\n"),
+      planned
+    );
+    expect(full.resources[0]).toMatchObject({ action: "replace", state: "done" });
   });
 });
