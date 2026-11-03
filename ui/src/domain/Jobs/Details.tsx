@@ -36,7 +36,7 @@ import { TerminalOutput } from "./TerminalOutput";
 import { getJobOutputRequestUrl, getPublicApiOrigin, isTerrakubeApiUrl } from "./outputUrl";
 import { shouldStepBeCollapsible, shouldStepBeExpandedByDefault } from "./stepExpansion";
 import { ApplyProgress } from "./ApplyProgress";
-import { hasApplyProgress, plannedFromChanges } from "./applyProgressParser";
+import { hasApplyProgress, parseApplyProgress, plannedFromChanges } from "./applyProgressParser";
 import { StructuredPlanOutput } from "./StructuredPlanOutput";
 import { StructuredPlanOutputByStep, normalizeStructuredPlanOutput, normalizeUITemplates } from "./structuredPlan";
 
@@ -45,6 +45,10 @@ type Props = {
 };
 
 const TERMINAL_JOB_STATUSES = new Set(["completed", "noChanges", "failed", "cancelled", "rejected", "notExecuted"]);
+const LOG_PLACEHOLDERS = new Set(["Waiting logs...", "Initializing the backend...", "No logs available"]);
+// The job can turn terminal a few seconds before the executor has flushed the last log chunk, so
+// keep refreshing for a short while (12 x 5s) after the end until every finished step has its log.
+const MAX_FINAL_LOG_REFRESHES = 12;
 const INCOMPLETE_VARIABLE_GUARD_STEP_NAME = "Incomplete sensitive variables";
 
 type IncompleteVariableGuard = {
@@ -71,6 +75,7 @@ export const DetailsJob = ({ jobId }: Props) => {
   const jobRequestRef = useRef(0);
   const contextRequestRef = useRef(0);
   const pollRequestRef = useRef(0);
+  const finalLogRefreshesRef = useRef(0);
 
   const isAbortError = (error: unknown) => {
     return error instanceof Error && (error.name === "AbortError" || error.name === "CanceledError");
@@ -504,13 +509,37 @@ export const DetailsJob = ({ jobId }: Props) => {
     void refreshJobDetails();
   }, [abortContextRequests, abortJobRequests, jobId, refreshJobDetails]);
 
+  // A finished step whose log is still a placeholder, or an apply log that stops mid-resource, means
+  // we fetched the log before it was complete.
+  const hasIncompleteFinishedLog = (steps ?? []).some((step) => {
+    if (step.status !== "completed" && step.status !== "failed") {
+      return false;
+    }
+    if (LOG_PLACEHOLDERS.has(step.outputLog)) {
+      return true;
+    }
+    return (
+      step.status === "completed" && parseApplyProgress(step.outputLog).resources.some((r) => r.state === "running")
+    );
+  });
+  const jobIsTerminal = isTerminalJobStatus(job?.data?.attributes.status);
+
+  useEffect(() => {
+    finalLogRefreshesRef.current = 0;
+  }, [jobId]);
+
   usePolling(
     () => {
+      if (jobIsTerminal) {
+        finalLogRefreshesRef.current += 1;
+      }
       void refreshJobDetails();
     },
     {
       interval: 5000,
-      enabled: Boolean(jobId) && !isTerminalJobStatus(job?.data?.attributes.status),
+      enabled:
+        Boolean(jobId) &&
+        (!jobIsTerminal || (hasIncompleteFinishedLog && finalLogRefreshesRef.current < MAX_FINAL_LOG_REFRESHES)),
       immediate: false,
     }
   );
