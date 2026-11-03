@@ -10,7 +10,20 @@ import {
   SyncOutlined,
   UserOutlined,
 } from "@ant-design/icons";
-import { Alert, Avatar, Button, Card, Collapse, message, Radio, RadioChangeEvent, Space, Spin, Tag, Typography } from "antd";
+import {
+  Alert,
+  Avatar,
+  Button,
+  Card,
+  Collapse,
+  message,
+  Radio,
+  RadioChangeEvent,
+  Space,
+  Spin,
+  Tag,
+  Typography,
+} from "antd";
 import { AxiosResponse } from "axios";
 import parse from "html-react-parser";
 import { DateTime } from "luxon";
@@ -22,6 +35,8 @@ import { Job, JobStep } from "../types";
 import { TerminalOutput } from "./TerminalOutput";
 import { getJobOutputRequestUrl, getPublicApiOrigin, isTerrakubeApiUrl } from "./outputUrl";
 import { shouldStepBeCollapsible, shouldStepBeExpandedByDefault } from "./stepExpansion";
+import { ApplyProgress } from "./ApplyProgress";
+import { hasApplyProgress } from "./applyProgressParser";
 import { StructuredPlanOutput } from "./StructuredPlanOutput";
 import { StructuredPlanOutputByStep, normalizeStructuredPlanOutput, normalizeUITemplates } from "./structuredPlan";
 
@@ -178,6 +193,25 @@ export const DetailsJob = ({ jobId }: Props) => {
     const hasStructuredView = Boolean(template) || Boolean(structuredChanges);
 
     if (!hasStructuredView) {
+      // Apply/destroy steps have no plan data of their own: show per-resource progress
+      // parsed from the live log, with the console one toggle away.
+      if (hasApplyProgress(item.outputLog)) {
+        return (
+          <>
+            <div style={{ textAlign: "right", padding: "5px" }}>
+              <Radio.Group onChange={onChange} value={uiType} size="small">
+                <Radio.Button value="structured">Structured</Radio.Button>
+                <Radio.Button value="console">Console</Radio.Button>
+              </Radio.Group>
+            </div>
+            {uiType === "structured" ? (
+              <ApplyProgress outputLog={item.outputLog} isRunning={item.status === "running"} />
+            ) : (
+              renderConsoleOutput(item)
+            )}
+          </>
+        );
+      }
       return renderConsoleOutput(item);
     }
 
